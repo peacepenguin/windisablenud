@@ -1,32 +1,28 @@
-// LocalSubnetGuard - disables Neighbor Unreachability Detection (NUD) failover, so traffic for
-// directly-connected subnets stays on its local NIC and never leaks out the default gateway.
+// LocalSubnetGuard - disables Neighbor Unreachability Detection (NUD) on network adapters that have no
+// default gateway, so traffic for their directly-connected subnets stays on them instead of failing
+// over to the default gateway on another adapter.
 //
 // Windows treats an on-link destination whose neighbor entry is Unreachable as unroutable on that
-// NIC and falls back to the next best route - normally the default gateway on another NIC. This
-// service prevents that with three layers, for IPv4 and IPv6:
+// adapter and sends it to the next best route - normally the default gateway on another adapter. For
+// every connected adapter without a default gateway (checked per address family, IPv4 and IPv6):
 //
-//  1. NUD off   NeighborUnreachabilityDetection is disabled on every interface that owns a protected
-//               subnet, so its neighbors are not marked Unreachable in the first place.
-//  2. Hold      a neighbor in a protected subnet that is marked Unreachable anyway has its entry
-//               deleted and the path cache flushed, so Windows re-resolves it on the local NIC
-//               instead of re-routing it.
-//  3. Firewall  an outbound block rule for the protected subnets on every default-gateway NIC, so
-//               nothing that slips through can leave via the gateway.
+//  1. NUD off  NeighborUnreachabilityDetection is disabled on the adapter, so its neighbors are not
+//              marked Unreachable in the first place.
+//  2. Hold     a neighbor on that adapter that is marked Unreachable anyway has its entry deleted and
+//              the path cache flushed, so Windows re-resolves it on the local adapter instead of
+//              re-routing it.
 //
-// Protected subnets are the connected subnets of NICs that have no default gateway (per address
-// family). They are learned automatically and remembered in %ProgramData%\LocalSubnetGuard\state.txt,
-// so protection survives reboots and unplugged NICs; 'forget' drops them. A remembered subnet that
-// overlaps a subnet connected on another NIC is suspended until the overlap goes away. Protection
-// stays in place while the service is stopped; 'uninstall' removes it.
+// Everything follows the live network configuration: nothing is blocked and nothing is remembered
+// except which adapters the service turned NUD off on (%ProgramData%\LocalSubnetGuard\state.txt), so
+// 'uninstall' can turn it back on. An adapter that gains a default gateway gets NUD back right away.
 //
 // Build: build.cmd (uses the .NET Framework 4.x csc.exe that ships with Windows).
 //
 // Usage (elevated, except status):
 //   LocalSubnetGuard.exe install [intervalMs]   install + start as a Windows service (default 250 ms)
-//   LocalSubnetGuard.exe uninstall              remove the service and all protection
-//   LocalSubnetGuard.exe run [intervalMs]       run in this console; protection is removed on exit
-//   LocalSubnetGuard.exe status                 show interfaces, protected subnets, NUD, rules, neighbors
-//   LocalSubnetGuard.exe forget <cidr>|all      stop protecting a remembered subnet (or all of them)
+//   LocalSubnetGuard.exe uninstall              remove the service and turn NUD back on
+//   LocalSubnetGuard.exe run [intervalMs]       run in this console; NUD is turned back on at exit
+//   LocalSubnetGuard.exe status                 show adapters, NUD settings and neighbors
 
 using System;
 using System.Collections.Generic;
@@ -50,7 +46,6 @@ namespace LocalSubnetGuard
     {
         public const string ServiceName = "LocalSubnetGuard";
         public const int DefaultIntervalMs = 250;
-        public const int RefreshCommand = 128; // service custom control: re-read state and re-apply now
 
         static int Main(string[] args)
         {
@@ -71,9 +66,6 @@ namespace LocalSubnetGuard
                 case "uninstall":
                     if (!IsAdmin()) return NotAdmin();
                     return Setup.Uninstall();
-                case "forget":
-                    if (!IsAdmin()) return NotAdmin();
-                    return Forget(args);
                 case "help": case "h": case "?":
                     Help(); return 0;
                 default:
@@ -103,16 +95,14 @@ namespace LocalSubnetGuard
         static void Help()
         {
             Console.WriteLine(
-@"LocalSubnetGuard - disable NUD failover: keep connected-subnet traffic on its local NIC
+@"LocalSubnetGuard - disable NUD on adapters without a default gateway, so their traffic never fails over
 
   LocalSubnetGuard.exe install [intervalMs]   install + start the service (default 250 ms)
-  LocalSubnetGuard.exe uninstall              remove the service and all protection
-  LocalSubnetGuard.exe run [intervalMs]       run in this console; protection is removed on exit
-  LocalSubnetGuard.exe status                 show interfaces, protected subnets, NUD, rules, neighbors
-  LocalSubnetGuard.exe forget <cidr>|all      stop protecting a remembered subnet (or all of them)
+  LocalSubnetGuard.exe uninstall              remove the service and turn NUD back on
+  LocalSubnetGuard.exe run [intervalMs]       run in this console; NUD is turned back on at exit
+  LocalSubnetGuard.exe status                 show adapters, NUD settings and neighbors
 
-State: " + StateStore.PathName + @"
-Log:   " + Log.PathName);
+Log: " + Log.PathName);
         }
 
         static int RunConsole(int intervalMs)
@@ -126,59 +116,20 @@ Log:   " + Log.PathName);
             ConsoleExit.Install();
             var g = new Guard(intervalMs);
             g.Start();
-            Log.Write("Running in console. Ctrl+C to stop; protection is removed on exit.");
+            Log.Write("Running in console. Ctrl+C to stop; NUD is turned back on at exit.");
             ConsoleExit.Requested.WaitOne();
             g.Stop();
-            Guard.Teardown(false);
+            Guard.RestoreAll();
             ConsoleExit.Done.Set();
-            return 0;
-        }
-
-        static int Forget(string[] args)
-        {
-            Prefix target = null;
-            if (args.Length != 2 || (!args[1].Equals("all", StringComparison.OrdinalIgnoreCase) && !Prefix.TryParse(args[1], out target)))
-            {
-                Console.Error.WriteLine("Usage: LocalSubnetGuard.exe forget <cidr>|all");
-                return 1;
-            }
-
-            int removed;
-            using (StateStore.Lock())
-            {
-                var st = StateStore.Load();
-                if (target == null) { removed = st.Subnets.Count; st.Subnets.Clear(); st.Gateways.Clear(); }
-                else removed = st.Subnets.RemoveAll(s => s.Prefix.Equals(target));
-                StateStore.Save(st);
-            }
-            Console.WriteLine(removed == 0 ? "No matching protected subnet." : string.Format("Forgot {0} subnet(s).", removed));
-
-            var relearn = new State();
-            Planner.Learn(relearn, Net.Snapshot(), s => { });
-            foreach (var s in relearn.Subnets.Where(s => target == null || s.Prefix.Equals(target)))
-                Console.WriteLine("Note: {0} is connected on '{1}', so it is protected again right away.", s.Prefix, s.NicName);
-
-            if (Setup.ServiceRunning())
-            {
-                using (var sc = new ServiceController(ServiceName)) sc.ExecuteCommand(RefreshCommand);
-            }
-            else
-            {
-                Log.Echo = true;
-                new Guard(DefaultIntervalMs).Refresh();
-            }
             return 0;
         }
 
         static int Status()
         {
             var snap = Net.Snapshot();
-            var st = StateStore.Load();
-            var recorded = new HashSet<Prefix>(st.Subnets.Select(s => s.Prefix));
-            Planner.Learn(st, snap, s => { }); // in memory only: also show what the service would learn now
-            var plan = Planner.Build(st, snap);
+            var plan = Planner.Build(snap);
 
-            Console.WriteLine("Connected interfaces:");
+            Console.WriteLine("Connected adapters:");
             foreach (var n in snap.Nics.Where(n => n.Up))
             {
                 string gw = n.Gw4 && n.Gw6 ? "IPv4+IPv6" : n.Gw4 ? "IPv4" : n.Gw6 ? "IPv6" : "none";
@@ -186,37 +137,26 @@ Log:   " + Log.PathName);
                     n.Prefixes.Count == 0 ? "-" : string.Join(", ", n.Prefixes));
             }
 
-            Console.WriteLine("Protected subnets:");
-            if (st.Subnets.Count == 0) Console.WriteLine("  (none)");
-            foreach (var s in st.Subnets)
-            {
-                string why;
-                string state = plan.Suspended.TryGetValue(s, out why) ? "SUSPENDED: " + why
-                    : plan.Held.Any(h => h.Prefix.Equals(s.Prefix)) ? "active" : "active (NIC not connected)";
-                if (!recorded.Contains(s.Prefix)) state += " (not recorded yet; the service learns it when it runs)";
-                Console.WriteLine("  {0,-22} on '{1}'  {2}", s.Prefix, s.NicName, state);
-            }
-
-            Console.WriteLine("NUD on protecting interfaces:");
-            if (plan.Nud.Count == 0) Console.WriteLine("  (none)");
+            Console.WriteLine("Protected (NUD off, Unreachable neighbors held):");
+            if (plan.Nud.Count == 0) Console.WriteLine("  (none: every connected adapter has a default gateway)");
             foreach (var t in plan.Nud)
             {
                 bool? on = Nud.Get(t.Family, t.IfIndex);
-                Console.WriteLine("  [{0}] {1} {2}: {3}", t.IfIndex, t.NicName, Net.FamilyName(t.Family),
-                    on == null ? "unknown" : on.Value ? "ENABLED (the service disables it)" : "disabled");
+                var subnets = plan.Held.Where(h => h.IfIndex == t.IfIndex && h.Prefix.Family == t.Family).Select(h => h.Prefix.ToString());
+                Console.WriteLine("  [{0}] {1} {2}  {3}  NUD: {4}", t.IfIndex, t.NicName, Net.FamilyName(t.Family), string.Join(", ", subnets),
+                    on == null ? "unknown" : on.Value ? "enabled (the service turns it off)" : "off");
             }
 
-            Console.WriteLine("Firewall rules (group '{0}'):", Firewall.Group);
-            foreach (var r in Firewall.Describe()) Console.WriteLine("  " + r);
-            foreach (var w in Firewall.Problems()) Console.WriteLine("  WARNING: " + w);
+            var st = StateStore.Load();
+            foreach (var r in st.Nud.Where(r => !plan.Nud.Any(t => Net.SameId(t.NicId, r.NicId) && t.Family == r.Family)))
+                Console.WriteLine("  '{0}' {1}: NUD was turned off by the service; it is turned back on when the adapter is connected",
+                    r.NicName, Net.FamilyName(r.Family));
 
             Console.WriteLine("Neighbors in protected subnets:");
             foreach (var fam in Net.Families)
                 foreach (var n in Neighbors.Read(fam))
-                {
-                    var h = Planner.Match(plan.Held, n);
-                    if (h != null) Console.WriteLine("  {0,-28} [{1}] {2}", n.Address, n.IfIndex, n.State);
-                }
+                    if (Planner.Match(plan.Held, n) != null)
+                        Console.WriteLine("  {0,-28} [{1}] {2}", n.Address, n.IfIndex, n.State);
 
             if (Setup.ServiceExists())
                 using (var sc = new ServiceController(ServiceName)) Console.WriteLine("Service: " + sc.Status);
@@ -264,7 +204,6 @@ Log:   " + Log.PathName);
         protected override void OnStart(string[] args) { _g.Start(); }
         protected override void OnStop() { _g.Stop(); }
         protected override void OnShutdown() { _g.Stop(); }
-        protected override void OnCustomCommand(int command) { if (command == Program.RefreshCommand) _g.RequestRefresh(); }
     }
 
     // ------------------------------------------------------------------ core loop
@@ -274,7 +213,7 @@ Log:   " + Log.PathName);
         readonly HoldTracker _hold4 = new HoldTracker(), _hold6 = new HoldTracker();
         readonly HashSet<string> _nudFailures = new HashSet<string>();
         Plan _plan = new Plan();
-        string _lastSig, _lastProblems;
+        string _lastSig;
         volatile bool _refresh = true;
         DateTime _nextRefresh = DateTime.MinValue;
         Thread _thread;
@@ -286,14 +225,14 @@ Log:   " + Log.PathName);
         {
             Log.Write(string.Format("Starting (interval {0} ms).", _intervalMs));
             DataDir.Secure();
+            LegacyFirewallRules.Remove();
             NetworkChange.NetworkAddressChanged += OnNetChange;
             NetworkChange.NetworkAvailabilityChanged += OnNetAvailability;
             _thread = new Thread(Loop) { IsBackground = true, Name = "LocalSubnetGuard" };
             _thread.Start();
         }
 
-        // Stops the loop only: firewall rules and NUD settings stay in place, so protection holds
-        // across service restarts and reboots.
+        // Stops the loop only: NUD stays off, so protection holds across service restarts and reboots.
         public void Stop()
         {
             NetworkChange.NetworkAddressChanged -= OnNetChange;
@@ -303,7 +242,6 @@ Log:   " + Log.PathName);
             Log.Write("Stopped.");
         }
 
-        public void RequestRefresh() { _refresh = true; }
         void OnNetChange(object s, EventArgs e) { _refresh = true; }
         void OnNetAvailability(object s, NetworkAvailabilityEventArgs e) { _refresh = true; }
 
@@ -326,24 +264,25 @@ Log:   " + Log.PathName);
             }
         }
 
-        // Learns from the current topology, then brings NUD settings and firewall rules in line with the state.
-        public void Refresh()
+        void Refresh()
         {
             var snap = Net.Snapshot();
-            using (StateStore.Lock())
+            var plan = Planner.Build(snap);
+            var st = StateStore.Load();
+            if (ApplyNud(st, snap, plan)) StateStore.Save(st);
+
+            string sig = string.Join(", ", plan.Held.Select(h => h.Prefix + " on '" + h.NicName + "'"));
+            if (sig != _lastSig)
             {
-                var st = StateStore.Load(); // always re-read: 'forget' may have changed it
-                bool dirty = Planner.Learn(st, snap, Log.Write);
-                var plan = Planner.Build(st, snap);
-                if (ApplyNud(st, snap, plan)) dirty = true;
-                if (dirty) StateStore.Save(st);
-                ApplyFirewall(plan);
-                _plan = plan;
+                _lastSig = sig;
+                Log.Write(sig == "" ? "Nothing to protect: every connected adapter has a default gateway." : "Protecting " + sig + ".");
             }
+            _plan = plan;
         }
 
-        // Disables NUD where the plan wants it off and re-enables it where we turned it off and no
-        // longer need to. Returns true if st changed.
+        // Turns NUD off where the plan wants it off, and back on where we turned it off and the adapter is
+        // connected but no longer qualifies (it gained a default gateway, or lost its addresses). Adapters
+        // that are disconnected or absent are left alone. Returns true if st changed.
         bool ApplyNud(State st, NetSnapshot snap, Plan plan)
         {
             bool dirty = false;
@@ -357,18 +296,22 @@ Log:   " + Log.PathName);
                 }
                 int rc = Nud.Set(t.Family, t.IfIndex, false);
                 string key = t.NicId + Net.FamilyName(t.Family);
-                if (rc == 0) { _nudFailures.Remove(key); Log.Write(string.Format("NUD disabled on '{0}' ({1}).", t.NicName, Net.FamilyName(t.Family))); }
-                else if (_nudFailures.Add(key)) Log.Write(string.Format("ERROR: could not disable NUD on '{0}' ({1}): error {2}.", t.NicName, Net.FamilyName(t.Family), rc));
+                if (rc == 0) { _nudFailures.Remove(key); Log.Write(string.Format("NUD turned off on '{0}' ({1}).", t.NicName, Net.FamilyName(t.Family))); }
+                else if (_nudFailures.Add(key)) Log.Write(string.Format("ERROR: could not turn off NUD on '{0}' ({1}): error {2}.", t.NicName, Net.FamilyName(t.Family), rc));
             }
             foreach (var r in st.Nud.ToList())
             {
                 if (plan.Nud.Any(t => Net.SameId(t.NicId, r.NicId) && t.Family == r.Family)) continue;
                 var nic = snap.Find(r.NicId);
-                int idx = nic == null ? -1 : nic.Index(r.Family);
-                if (idx < 0) continue; // NIC not present: restore it when it comes back
-                RestoreNud(r, idx);
+                if (nic == null || !nic.Up || nic.Index(r.Family) < 0) continue;
+                RestoreNud(r, nic.Index(r.Family));
                 st.Nud.Remove(r);
                 dirty = true;
+            }
+            foreach (var r in st.Nud)
+            {
+                var nic = snap.Find(r.NicId);
+                if (nic != null && nic.Name != r.NicName) { r.NicName = nic.Name; dirty = true; } // follow renames
             }
             return dirty;
         }
@@ -376,29 +319,8 @@ Log:   " + Log.PathName);
         static void RestoreNud(NudRecord r, int ifIndex)
         {
             int rc = Nud.Set(r.Family, ifIndex, true);
-            Log.Write(rc == 0 ? string.Format("NUD re-enabled on '{0}' ({1}).", r.NicName, Net.FamilyName(r.Family))
-                              : string.Format("ERROR: could not re-enable NUD on '{0}' ({1}): error {2}.", r.NicName, Net.FamilyName(r.Family), rc));
-        }
-
-        void ApplyFirewall(Plan plan)
-        {
-            Firewall.Sync(plan.Rules); // cheap when nothing changed; also repairs edited or deleted rules
-            string sig = plan.Signature;
-            if (sig != _lastSig)
-            {
-                _lastSig = sig;
-                if (plan.Rules.Count == 0) Log.Write("No firewall rules needed.");
-                foreach (var kv in plan.Rules)
-                    Log.Write(string.Format("Rule: block outbound on '{0}' -> {1}", kv.Key, string.Join(", ", kv.Value)));
-                foreach (var kv in plan.Suspended)
-                    Log.Write(string.Format("Suspended {0} (from '{1}'): {2}", kv.Key.Prefix, kv.Key.NicName, kv.Value));
-            }
-            string problems = plan.Rules.Count == 0 ? "" : string.Join(" ", Firewall.Problems());
-            if (problems != _lastProblems)
-            {
-                if (problems != "") Log.Write("WARNING: " + problems);
-                _lastProblems = problems;
-            }
+            Log.Write(rc == 0 ? string.Format("NUD turned back on on '{0}' ({1}).", r.NicName, Net.FamilyName(r.Family))
+                              : string.Format("ERROR: could not turn NUD back on on '{0}' ({1}): error {2}.", r.NicName, Net.FamilyName(r.Family), rc));
         }
 
         void Tick()
@@ -421,31 +343,26 @@ Log:   " + Log.PathName);
             }
         }
 
-        // Removes all protection: firewall rules are deleted and NUD settings restored.
-        // With forgetAll the state file (learned subnets and gateways) is deleted as well.
-        public static void Teardown(bool forgetAll)
+        // Turns NUD back on everywhere the service turned it off. Adapters that are not present keep
+        // their record (console mode) or get a logged netsh command (uninstall, which deletes the state).
+        public static void RestoreAll(bool deleteState = false)
         {
-            using (StateStore.Lock())
+            var st = StateStore.Load();
+            var snap = Net.Snapshot();
+            foreach (var r in st.Nud.ToList())
             {
-                var st = StateStore.Load();
-                Firewall.Sync(new Dictionary<string, List<string>>());
-                Log.Write("Firewall rules removed.");
-                var snap = Net.Snapshot();
-                foreach (var r in st.Nud.ToList())
+                var nic = snap.Find(r.NicId);
+                int idx = nic == null ? -1 : nic.Index(r.Family);
+                if (idx < 0)
                 {
-                    var nic = snap.Find(r.NicId);
-                    int idx = nic == null ? -1 : nic.Index(r.Family);
-                    if (idx < 0)
-                    {
-                        Log.Write(string.Format("WARNING: '{0}' is not present, so NUD could not be re-enabled on it. When it is back, run: " +
-                            "netsh interface {1} set interface \"{0}\" nud=enabled", r.NicName, Net.FamilyName(r.Family).ToLowerInvariant()));
-                        continue;
-                    }
-                    RestoreNud(r, idx);
-                    st.Nud.Remove(r);
+                    Log.Write(string.Format("WARNING: '{0}' is not present, so NUD could not be turned back on. When it is back, run: " +
+                        "netsh interface {1} set interface \"{0}\" nud=enabled", r.NicName, Net.FamilyName(r.Family).ToLowerInvariant()));
+                    continue;
                 }
-                if (forgetAll) StateStore.Delete(); else StateStore.Save(st);
+                RestoreNud(r, idx);
+                st.Nud.Remove(r);
             }
+            if (deleteState) StateStore.Delete(); else StateStore.Save(st);
         }
     }
 
@@ -476,7 +393,7 @@ Log:   " + Log.PathName);
                     if (e == null)
                     {
                         _held[r.Key] = e = new Entry { Nic = nic, Since = now };
-                        log(string.Format("{0} marked Unreachable on '{1}' - holding it on the local NIC", r.Address, nic));
+                        log(string.Format("{0} marked Unreachable on '{1}' - holding it on the local adapter", r.Address, nic));
                     }
                     e.LastHeld = now;
                     e.Holds++;
@@ -501,13 +418,10 @@ Log:   " + Log.PathName);
 
     // ------------------------------------------------------------------ planning (pure; unit tested)
     class NicRef { public string NicId, NicName; }
-    class ProtectedSubnet : NicRef { public Prefix Prefix; }  // NIC = the NIC the subnet is connected on
-    class NudRecord : NicRef { public AddressFamily Family; } // we disabled NUD here and must re-enable it
+    class NudRecord : NicRef { public AddressFamily Family; } // the service turned NUD off here and must turn it back on
 
     class State
     {
-        public List<ProtectedSubnet> Subnets = new List<ProtectedSubnet>();
-        public List<NicRef> Gateways = new List<NicRef>(); // every NIC seen with a default gateway (sticky)
         public List<NudRecord> Nud = new List<NudRecord>();
 
         public NudRecord FindNud(string nicId, AddressFamily f)
@@ -517,9 +431,7 @@ Log:   " + Log.PathName);
 
         public string Serialize()
         {
-            var sb = new StringBuilder("# LocalSubnetGuard state, maintained by the service. Use 'LocalSubnetGuard.exe forget' to drop subnets.\r\n");
-            foreach (var s in Subnets) sb.AppendFormat("subnet {0} {1} {2}\r\n", s.Prefix, s.NicId, s.NicName);
-            foreach (var g in Gateways) sb.AppendFormat("gateway {0} {1}\r\n", g.NicId, g.NicName);
+            var sb = new StringBuilder("# LocalSubnetGuard: adapters it turned NUD off on, so uninstall can turn it back on.\r\n");
             foreach (var n in Nud) sb.AppendFormat("nud {0} {1} {2}\r\n", Net.FamilyName(n.Family), n.NicId, n.NicName);
             return sb.ToString();
         }
@@ -530,17 +442,9 @@ Log:   " + Log.PathName);
             var space = new[] { ' ' };
             foreach (var raw in text.Split('\n'))
             {
-                string line = raw.Trim();
-                if (line.Length == 0 || line[0] == '#') continue;
-                string kw = line.Split(space, 2)[0];
-                string[] f;
-                Prefix p;
+                string[] f = raw.Trim().Split(space, 4);
                 AddressFamily fam;
-                if (kw == "subnet" && (f = line.Split(space, 4)).Length == 4 && Prefix.TryParse(f[1], out p))
-                    st.Subnets.Add(new ProtectedSubnet { Prefix = p, NicId = f[2], NicName = f[3] });
-                else if (kw == "gateway" && (f = line.Split(space, 3)).Length == 3)
-                    st.Gateways.Add(new NicRef { NicId = f[1], NicName = f[2] });
-                else if (kw == "nud" && (f = line.Split(space, 4)).Length == 4 && Net.TryParseFamily(f[1], out fam))
+                if (f.Length == 4 && f[0] == "nud" && Net.TryParseFamily(f[1], out fam))
                     st.Nud.Add(new NudRecord { Family = fam, NicId = f[2], NicName = f[3] });
             }
             return st;
@@ -552,97 +456,26 @@ Log:   " + Log.PathName);
 
     class Plan
     {
-        public List<ProtectedSubnet> Blocked = new List<ProtectedSubnet>();                      // active subnets
-        public Dictionary<ProtectedSubnet, string> Suspended = new Dictionary<ProtectedSubnet, string>(); // -> reason
-        public SortedDictionary<string, List<string>> Rules =                                   // gateway NIC -> CIDRs
-            new SortedDictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-        public List<HeldSubnet> Held = new List<HeldSubnet>(); // active subnets whose NIC is connected
-        public List<NudTarget> Nud = new List<NudTarget>();    // (NIC, family) pairs that must have NUD off
-
-        public string Signature
-        {
-            get
-            {
-                return string.Join(";", Rules.Select(kv => kv.Key + "=" + string.Join(",", kv.Value))) + "|" +
-                       string.Join(";", Suspended.Select(kv => kv.Key.Prefix + " " + kv.Value));
-            }
-        }
+        public List<NudTarget> Nud = new List<NudTarget>();    // (adapter, family) pairs that get NUD off
+        public List<HeldSubnet> Held = new List<HeldSubnet>(); // their connected subnets
     }
 
     static class Planner
     {
-        // Records gateway NICs and the connected subnets of NICs without a gateway for that family.
-        // Returns true if st changed.
-        public static bool Learn(State st, NetSnapshot snap, Action<string> log)
-        {
-            bool dirty = false;
-            var up = snap.Nics.Where(n => n.Up).ToList();
-
-            foreach (var n in up.Where(n => n.Gw4 || n.Gw6))
-                if (!st.Gateways.Any(g => Net.SameId(g.NicId, n.Id)))
-                {
-                    st.Gateways.Add(new NicRef { NicId = n.Id, NicName = n.Name });
-                    log(string.Format("Learned gateway NIC '{0}'.", n.Name));
-                    dirty = true;
-                }
-
-            foreach (var n in up)
-                foreach (var p in n.Prefixes)
-                {
-                    if (n.HasGateway(p.Family)) continue;
-                    if (up.Any(o => o != n && o.HasGateway(p.Family) && o.Prefixes.Any(q => q.Overlaps(p)))) continue; // reachable via a gateway NIC's LAN
-                    var s = st.Subnets.FirstOrDefault(x => x.Prefix.Equals(p));
-                    if (s == null)
-                    {
-                        st.Subnets.Add(new ProtectedSubnet { Prefix = p, NicId = n.Id, NicName = n.Name });
-                        log(string.Format("Learned protected subnet {0} on '{1}'.", p, n.Name));
-                        dirty = true;
-                    }
-                    else if (!Net.SameId(s.NicId, n.Id))
-                    {
-                        var owner = snap.Find(s.NicId);
-                        if (owner != null && owner.Up && owner.Prefixes.Contains(p)) continue; // on both NICs: keep the current one
-                        log(string.Format("Protected subnet {0} moved from '{1}' to '{2}'.", p, s.NicName, n.Name));
-                        s.NicId = n.Id;
-                        s.NicName = n.Name;
-                        dirty = true;
-                    }
-                }
-
-            // follow NIC renames
-            foreach (var r in st.Subnets.Cast<NicRef>().Concat(st.Gateways).Concat(st.Nud))
-            {
-                var n = snap.Find(r.NicId);
-                if (n != null && n.Name != r.NicName) { r.NicName = n.Name; dirty = true; }
-            }
-            return dirty;
-        }
-
-        public static Plan Build(State st, NetSnapshot snap)
+        // Every connected adapter without a default gateway for a family gets NUD off for that family,
+        // and its subnets of that family are held. Built from the live configuration only.
+        public static Plan Build(NetSnapshot snap)
         {
             var plan = new Plan();
-            var up = snap.Nics.Where(n => n.Up).ToList();
-            foreach (var s in st.Subnets)
-            {
-                var clash = up.Where(n => !Net.SameId(n.Id, s.NicId))
-                              .SelectMany(n => n.Prefixes.Where(p => p.Overlaps(s.Prefix)).Select(p => p + " on '" + n.Name + "'"))
-                              .FirstOrDefault();
-                if (clash != null) { plan.Suspended[s] = "overlaps " + clash; continue; }
-                plan.Blocked.Add(s);
-
-                var owner = snap.Find(s.NicId);
-                int idx = owner == null ? -1 : owner.Index(s.Prefix.Family);
-                if (idx < 0) continue;
-                if (!plan.Nud.Any(t => Net.SameId(t.NicId, owner.Id) && t.Family == s.Prefix.Family))
-                    plan.Nud.Add(new NudTarget { NicId = owner.Id, NicName = owner.Name, Family = s.Prefix.Family, IfIndex = idx });
-                if (owner.Up)
-                    plan.Held.Add(new HeldSubnet { Prefix = s.Prefix, IfIndex = idx, NicName = owner.Name });
-            }
-            foreach (var g in st.Gateways)
-            {
-                var cidrs = plan.Blocked.Where(s => !Net.SameId(s.NicId, g.NicId)).Select(s => s.Prefix.ToString()).ToList();
-                if (cidrs.Count > 0) plan.Rules[g.NicName] = cidrs; // never an empty list: that would mean "any address"
-            }
+            foreach (var n in snap.Nics.Where(n => n.Up))
+                foreach (var fam in Net.Families)
+                {
+                    int idx = n.Index(fam);
+                    var prefixes = n.Prefixes.Where(p => p.Family == fam).ToList();
+                    if (idx < 0 || n.HasGateway(fam) || prefixes.Count == 0) continue;
+                    plan.Nud.Add(new NudTarget { NicId = n.Id, NicName = n.Name, Family = fam, IfIndex = idx });
+                    foreach (var p in prefixes) plan.Held.Add(new HeldSubnet { Prefix = p, IfIndex = idx, NicName = n.Name });
+                }
             return plan;
         }
 
@@ -667,13 +500,12 @@ Log:   " + Log.PathName);
         }
 
         public AddressFamily Family { get { return _net.Length == 4 ? AddressFamily.InterNetwork : AddressFamily.InterNetworkV6; } }
-        public bool Contains(byte[] addr) { return addr.Length == _net.Length && SameBits(addr, _net, Length); }
-        public bool Overlaps(Prefix o) { return o._net.Length == _net.Length && SameBits(o._net, _net, Math.Min(Length, o.Length)); }
 
-        static bool SameBits(byte[] a, byte[] b, int bits)
+        public bool Contains(byte[] addr)
         {
-            for (int i = 0; bits > 0; i++, bits -= 8)
-                if (((a[i] ^ b[i]) & (0xFF00 >> Math.Min(8, bits))) != 0) return false;
+            if (addr.Length != _net.Length) return false;
+            for (int i = 0, bits = Length; bits > 0; i++, bits -= 8)
+                if (((addr[i] ^ _net[i]) & (0xFF00 >> Math.Min(8, bits))) != 0) return false;
             return true;
         }
 
@@ -744,7 +576,7 @@ Log:   " + Log.PathName);
             return s.Equals("IPv4", StringComparison.OrdinalIgnoreCase) || s.Equals("IPv6", StringComparison.OrdinalIgnoreCase);
         }
 
-        // Every NIC except loopback and transition tunnels (Teredo, 6to4, ISATAP, IP-HTTPS).
+        // Every adapter except loopback and transition tunnels (Teredo, 6to4, ISATAP, IP-HTTPS).
         public static NetSnapshot Snapshot()
         {
             var snap = new NetSnapshot();
@@ -778,7 +610,7 @@ Log:   " + Log.PathName);
         }
     }
 
-    // ------------------------------------------------------------------ per-interface NUD switch (IP Helper)
+    // ------------------------------------------------------------------ per-adapter NUD switch (IP Helper)
     static class Nud
     {
         // MIB_IPINTERFACE_ROW (168 bytes): Family @0, InterfaceLuid @8, InterfaceIndex @16, ...,
@@ -878,123 +710,28 @@ Log:   " + Log.PathName);
         public static void FlushPathCache(AddressFamily f) { FlushIpPathTable(Net.Af(f)); }
     }
 
-    // ------------------------------------------------------------------ Windows Firewall (COM)
-    static class Firewall
+    // ------------------------------------------------------------------ cleanup of earlier versions
+    // Earlier versions added outbound Windows Firewall block rules in this group; remove any left behind.
+    static class LegacyFirewallRules
     {
-        public const string Group = "LocalSubnetGuard";
-        const int DirOut = 2, ActionBlock = 0, ProtoAny = 256, ProfilesAll = 0x7FFFFFFF;
+        const string Group = "LocalSubnetGuard";
 
-        class Applied { public string Desired, ReadBack; }
-        static readonly Dictionary<string, Applied> _applied = new Dictionary<string, Applied>(); // rule name -> what we last wrote
-
-        static dynamic Policy() { return Activator.CreateInstance(Type.GetTypeFromProgID("HNetCfg.FwPolicy2")); }
-        static string RuleName(string nic) { return Group + " - block protected subnets on '" + nic + "'"; }
-
-        static List<dynamic> OurRules(dynamic pol)
+        public static void Remove()
         {
-            var list = new List<dynamic>();
-            foreach (dynamic r in pol.Rules)
+            try
             {
-                string g = null;
-                try { g = r.Grouping; } catch { }
-                if (g == Group) list.Add(r);
-            }
-            return list;
-        }
-
-        // Makes the group's rules exactly `desired` (gateway NIC name -> CIDRs), updating rules in place so
-        // there is never a moment without a block rule. Rules that already match are not touched.
-        public static void Sync(IDictionary<string, List<string>> desired)
-        {
-            dynamic pol = Policy();
-            var existing = new Dictionary<string, object>();
-            foreach (dynamic r in OurRules(pol)) existing[(string)r.Name] = r;
-
-            foreach (var kv in desired)
-            {
-                if (kv.Value.Count == 0) continue; // empty RemoteAddresses would mean "any address"
-                string name = RuleName(kv.Key), remote = string.Join(",", kv.Value);
-                object found;
-                dynamic rule;
-                if (existing.TryGetValue(name, out found))
+                dynamic pol = Activator.CreateInstance(Type.GetTypeFromProgID("HNetCfg.FwPolicy2"));
+                var names = new List<string>();
+                foreach (dynamic r in pol.Rules)
                 {
-                    existing.Remove(name);
-                    rule = found;
-                    if (IsCurrent(rule, name, kv.Key, remote)) continue;
-                    Configure(rule, kv.Key, remote);
+                    string g = null;
+                    try { g = r.Grouping; } catch { }
+                    if (g == Group) names.Add((string)r.Name);
                 }
-                else
-                {
-                    rule = Activator.CreateInstance(Type.GetTypeFromProgID("HNetCfg.FWRule"));
-                    rule.Name = name;
-                    Configure(rule, kv.Key, remote);
-                    pol.Rules.Add(rule);
-                    rule = pol.Rules.Item(name);
-                }
-                _applied[name] = new Applied { Desired = remote, ReadBack = (string)rule.RemoteAddresses };
+                foreach (var name in names) pol.Rules.Remove(name);
+                if (names.Count > 0) Log.Write(string.Format("Removed {0} firewall rule(s) left by an earlier version.", names.Count));
             }
-            foreach (var name in existing.Keys)
-            {
-                try { pol.Rules.Remove(name); } catch { }
-                _applied.Remove(name);
-            }
-        }
-
-        static bool IsCurrent(dynamic r, string name, string nic, string remote)
-        {
-            Applied a;
-            if (!_applied.TryGetValue(name, out a) || a.Desired != remote || a.ReadBack != (string)r.RemoteAddresses) return false;
-            object[] ifs = null;
-            try { ifs = r.Interfaces; } catch { }
-            return (bool)r.Enabled && (int)r.Direction == DirOut && (int)r.Action == ActionBlock && (int)r.Protocol == ProtoAny &&
-                   (int)r.Profiles == ProfilesAll && ifs != null && ifs.Length == 1 && nic.Equals(ifs[0] as string, StringComparison.OrdinalIgnoreCase);
-        }
-
-        static void Configure(dynamic rule, string nic, string remote)
-        {
-            rule.Description = "Managed by LocalSubnetGuard. Rebuilt automatically; do not edit.";
-            rule.Grouping = Group;
-            rule.Direction = DirOut;
-            rule.Action = ActionBlock;
-            rule.Protocol = ProtoAny;
-            rule.RemoteAddresses = remote;
-            rule.Interfaces = new object[] { nic };
-            rule.Profiles = ProfilesAll;
-            rule.Enabled = true;
-        }
-
-        public static IEnumerable<string> Describe()
-        {
-            dynamic pol = Policy();
-            var outp = new List<string>();
-            foreach (dynamic r in OurRules(pol))
-            {
-                string ifs = "";
-                try { object[] a = r.Interfaces; if (a != null) ifs = string.Join(", ", a.Select(x => x.ToString())); } catch { }
-                outp.Add(string.Format("{0}  [interface: {1}] [remote: {2}] [enabled: {3}]",
-                    (string)r.Name, ifs == "" ? "ANY" : ifs, (string)r.RemoteAddresses, (bool)r.Enabled));
-            }
-            if (outp.Count == 0) outp.Add("(none)");
-            return outp;
-        }
-
-        // Reasons the block rules may have no effect.
-        public static List<string> Problems()
-        {
-            var list = new List<string>();
-            object pol = Activator.CreateInstance(Type.GetTypeFromProgID("HNetCfg.FwPolicy2"));
-            Type t = pol.GetType();
-            int current = (int)t.InvokeMember("CurrentProfileTypes", BindingFlags.GetProperty, null, pol, null);
-            foreach (var p in new[] { new { Bit = 1, Name = "Domain" }, new { Bit = 2, Name = "Private" }, new { Bit = 4, Name = "Public" } })
-            {
-                if ((current & p.Bit) == 0) continue;
-                bool on = (bool)t.InvokeMember("FirewallEnabled", BindingFlags.GetProperty, null, pol, new object[] { p.Bit });
-                if (!on) list.Add("Windows Firewall " + p.Name + " profile is off, so the block rules have no effect.");
-            }
-            int modify = (int)t.InvokeMember("LocalPolicyModifyState", BindingFlags.GetProperty, null, pol, null);
-            if (modify == 1) // NET_FW_MODIFY_STATE_GP_OVERRIDE
-                list.Add("Group Policy overrides local firewall settings; if it disables local rule merging, the block rules have no effect.");
-            return list;
+            catch (Exception ex) { Log.Write("WARNING: could not check for old firewall rules: " + ex.Message); }
         }
     }
 
@@ -1076,7 +813,7 @@ Log:   " + Log.PathName);
                 : Run("sc.exe", "create " + Program.ServiceName + " binPath= \"" + bin + "\" start= auto DisplayName= \"Local Subnet Guard\"");
             if (rc != 0) return 1;
 
-            Run("sc.exe", "description " + Program.ServiceName + " \"Disables NUD failover: keeps connected-subnet traffic on its local NIC instead of the default gateway.\"");
+            Run("sc.exe", "description " + Program.ServiceName + " \"Disables NUD on adapters without a default gateway, so their traffic never fails over to the gateway.\"");
             Run("sc.exe", "failure " + Program.ServiceName + " reset= 86400 actions= restart/5000/restart/5000/restart/5000");
 
             using (var sc = new ServiceController(Program.ServiceName))
@@ -1094,8 +831,9 @@ Log:   " + Log.PathName);
             StopService();
             if (ServiceExists() && Run("sc.exe", "delete " + Program.ServiceName) != 0) return 1;
             Log.Echo = true;
-            Guard.Teardown(true);
-            Console.WriteLine("Service removed, firewall rules removed, NUD restored. (" + InstallDir + " left in place.)");
+            LegacyFirewallRules.Remove();
+            Guard.RestoreAll(true);
+            Console.WriteLine("Service removed and NUD turned back on. (" + InstallDir + " left in place.)");
             return 0;
         }
     }
@@ -1146,26 +884,6 @@ Log:   " + Log.PathName);
         }
 
         public static void Delete() { File.Delete(PathName); }
-
-        // Serializes load-modify-save between the service and elevated CLI commands.
-        public static IDisposable Lock()
-        {
-            var sec = new MutexSecurity();
-            foreach (var sid in new[] { WellKnownSidType.LocalSystemSid, WellKnownSidType.BuiltinAdministratorsSid })
-                sec.AddAccessRule(new MutexAccessRule(new SecurityIdentifier(sid, null), MutexRights.FullControl, AccessControlType.Allow));
-            bool created;
-            var m = new Mutex(false, @"Global\LocalSubnetGuard.State", out created, sec);
-            try { m.WaitOne(); }
-            catch (AbandonedMutexException) { } // previous holder died; we own it now
-            return new Releaser(m);
-        }
-
-        sealed class Releaser : IDisposable
-        {
-            readonly Mutex _m;
-            public Releaser(Mutex m) { _m = m; }
-            public void Dispose() { _m.ReleaseMutex(); _m.Dispose(); }
-        }
     }
 
     // ------------------------------------------------------------------ logging

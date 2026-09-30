@@ -34,19 +34,18 @@ namespace LocalSubnetGuard.Tests
         }
         static Prefix P(string s) { Prefix p; if (!Prefix.TryParse(s, out p)) throw new Exception("bad prefix " + s); return p; }
         static byte[] A(string s) { return IPAddress.Parse(s).GetAddressBytes(); }
-        static readonly List<string> NoLog = new List<string>();
 
         static NicInfo Nic(int index, string name, bool gw4, bool gw6, params string[] prefixes)
         {
             return new NicInfo { Id = "{" + index + "}", Name = name, Up = true, Gw4 = gw4, Gw6 = gw6, Index4 = index, Index6 = index,
                                  Prefixes = prefixes.Select(P).ToList() };
         }
-        static NetSnapshot Snap(params NicInfo[] nics) { return new NetSnapshot { Nics = nics.ToList() }; }
-        static State Learned(NetSnapshot snap) { var st = new State(); Planner.Learn(st, snap, s => { }); return st; }
-        static string Cidrs(IEnumerable<ProtectedSubnet> s) { return string.Join(",", s.Select(x => x.Prefix.ToString()).OrderBy(x => x)); }
+        static Plan Build(params NicInfo[] nics) { return Planner.Build(new NetSnapshot { Nics = nics.ToList() }); }
+        static string Targets(Plan p) { return string.Join(",", p.Nud.Select(t => t.NicName + " " + Net.FamilyName(t.Family)).OrderBy(x => x)); }
+        static string HeldCidrs(Plan p) { return string.Join(",", p.Held.Select(h => h.Prefix.ToString()).OrderBy(x => x)); }
 
-        // Typical laptop: Wi-Fi with the default gateway, plus a lab NIC with no gateway.
-        static NicInfo Wifi() { return Nic(1, "Wi-Fi", true, true, "192.168.1.0/24", "2001:db8:1::/64"); }
+        // Typical PC: an adapter with the default gateway, plus a lab adapter with none.
+        static NicInfo Wan() { return Nic(1, "Ethernet", true, true, "192.168.1.0/24", "2001:db8:1::/64"); }
         static NicInfo Lab() { return Nic(2, "Lab NIC", false, false, "192.168.50.0/24", "fd00:50::/64"); }
 
         // ---------------------------------------------------------------- Prefix
@@ -63,7 +62,7 @@ namespace LocalSubnetGuard.Tests
             True(P("192.168.50.9/24").Equals(P("192.168.50.0/24")), "equality ignores host bits");
         }
 
-        static void TestContainsAndOverlaps()
+        static void TestContains()
         {
             True(P("192.168.50.0/24").Contains(A("192.168.50.200")), "v4 contains");
             True(!P("192.168.50.0/24").Contains(A("192.168.51.1")), "v4 not contains");
@@ -71,9 +70,6 @@ namespace LocalSubnetGuard.Tests
             True(P("fd00:50::/64").Contains(A("fd00:50::1234")), "v6 contains");
             True(!P("fd00:50::/64").Contains(A("fd00:51::1")), "v6 not contains");
             True(!P("0.0.0.0/8").Contains(A("::1")), "family mismatch never contains");
-            True(P("10.0.0.0/16").Overlaps(P("10.0.5.0/24")) && P("10.0.5.0/24").Overlaps(P("10.0.0.0/16")), "overlap both ways");
-            True(!P("10.0.0.0/24").Overlaps(P("10.0.1.0/24")), "disjoint");
-            True(!P("10.0.0.0/8").Overlaps(P("a00::/8")), "different families never overlap");
         }
 
         static void TestInterfaceAddressFilter()
@@ -94,118 +90,48 @@ namespace LocalSubnetGuard.Tests
         static void TestStateRoundTrip()
         {
             var st = new State();
-            st.Subnets.Add(new ProtectedSubnet { Prefix = P("192.168.50.0/24"), NicId = "{A}", NicName = "Ethernet 2 (lab)" });
-            st.Subnets.Add(new ProtectedSubnet { Prefix = P("fd00:50::/64"), NicId = "{A}", NicName = "Ethernet 2 (lab)" });
-            st.Gateways.Add(new NicRef { NicId = "{B}", NicName = "Wi-Fi" });
+            st.Nud.Add(new NudRecord { NicId = "{A}", NicName = "Ethernet 2 (lab)", Family = AddressFamily.InterNetwork });
             st.Nud.Add(new NudRecord { NicId = "{A}", NicName = "Ethernet 2 (lab)", Family = AddressFamily.InterNetworkV6 });
-            var back = State.Parse(st.Serialize() + "garbage line\nsubnet not-a-prefix {X} x\n");
-            Eq(st.Serialize(), back.Serialize(), "round trip, bad lines ignored");
-            Eq("Ethernet 2 (lab)", back.Subnets[0].NicName, "names with spaces");
-            Eq(AddressFamily.InterNetworkV6, back.Nud[0].Family, "nud family");
+            // lines written by the previous version (remembered subnets and gateways) are ignored
+            var back = State.Parse(st.Serialize() + "subnet 10.1.1.0/24 {A} Ethernet 2\ngateway {B} Ethernet\ngarbage\nnud IPv5 {C} x\n");
+            Eq(st.Serialize(), back.Serialize(), "round trip");
+            Eq("Ethernet 2 (lab)", back.Nud[0].NicName, "names with spaces");
+            Eq(AddressFamily.InterNetworkV6, back.Nud[1].Family, "family");
         }
 
-        // ---------------------------------------------------------------- Planner.Learn
-        static void TestLearnProtectsOnlyNonGatewaySubnets()
+        // ---------------------------------------------------------------- Planner
+        static void TestOnlyAdaptersWithoutGatewayAreProtected()
         {
-            var st = Learned(Snap(Wifi(), Lab()));
-            Eq("192.168.50.0/24,fd00:50::/64", Cidrs(st.Subnets), "lab subnets learned, Wi-Fi's not");
-            Eq("Wi-Fi", string.Join(",", st.Gateways.Select(g => g.NicName)), "gateway NIC recorded");
+            var plan = Build(Wan(), Lab());
+            Eq("Lab NIC IPv4,Lab NIC IPv6", Targets(plan), "NUD off on the lab adapter only");
+            Eq("192.168.50.0/24,fd00:50::/64", HeldCidrs(plan), "lab subnets held");
+            True(plan.Nud.All(t => t.IfIndex == 2) && plan.Held.All(h => h.IfIndex == 2), "on the lab adapter's index");
         }
 
-        static void TestLearnIsPerFamily()
+        static void TestGatewayIsCheckedPerFamily()
         {
-            // The lab LAN has an IPv6 router but no IPv4 gateway: only its IPv4 subnet is protected.
-            var lab = Nic(2, "Lab NIC", false, true, "192.168.50.0/24", "2001:db8:50::/64");
-            var st = Learned(Snap(Wifi(), lab));
-            Eq("192.168.50.0/24", Cidrs(st.Subnets), "only the gateway-less family");
-            True(st.Gateways.Any(g => g.NicName == "Lab NIC"), "an IPv6-gateway NIC is a gateway NIC");
+            // The lab LAN has an IPv6 router but no IPv4 gateway: only IPv4 NUD is turned off there.
+            var plan = Build(Wan(), Nic(2, "Lab NIC", false, true, "192.168.50.0/24", "2001:db8:50::/64"));
+            Eq("Lab NIC IPv4", Targets(plan), "per family");
+            Eq("192.168.50.0/24", HeldCidrs(plan), "only IPv4 held");
         }
 
-        static void TestLearnSkipsSubnetsOverlappingAGatewayLan()
+        static void TestAdapterThatGainsAGatewayIsNotProtected()
         {
-            var wifi = Nic(1, "Wi-Fi", true, false, "10.0.5.0/24");
-            var lab = Nic(2, "Lab NIC", false, false, "10.0.0.0/16");
-            Eq("", Cidrs(Learned(Snap(wifi, lab)).Subnets), "10.0.0.0/16 would block Wi-Fi's own LAN");
+            var lab = Lab(); lab.Gw4 = lab.Gw6 = true;
+            Eq("", Targets(Build(Wan(), lab)), "nothing left to protect");
         }
 
-        static void TestLearnIsIdempotent()
+        static void TestDisconnectedAdapterIsNotProtected()
         {
-            var snap = Snap(Wifi(), Lab());
-            var st = Learned(snap);
-            True(!Planner.Learn(st, snap, s => { }), "second pass changes nothing");
+            var lab = Lab(); lab.Up = false;
+            Eq("", Targets(Build(Wan(), lab)), "follows the live configuration");
         }
 
-        static void TestOwnerDoesNotFlapWhenOnTwoNics()
+        static void TestFamilyWithoutAddressesIsSkipped()
         {
-            var a = Nic(2, "Lab A", false, false, "192.168.50.0/24");
-            var b = Nic(3, "Lab B", false, false, "192.168.50.0/24");
-            var st = Learned(Snap(Wifi(), a, b));
-            string owner = st.Subnets.Single().NicName;
-            True(!Planner.Learn(st, Snap(Wifi(), a, b), s => { }), "stable while on both NICs");
-            var survivor = owner == "Lab A" ? b : a;
-            True(Planner.Learn(st, Snap(Wifi(), survivor), s => { }), "moves when the owner disconnects");
-            Eq(survivor.Name, st.Subnets.Single().NicName, "new owner");
-        }
-
-        static void TestRenamesAreFollowed()
-        {
-            var st = Learned(Snap(Wifi(), Lab()));
-            st.Nud.Add(new NudRecord { NicId = "{2}", NicName = "Lab NIC", Family = AddressFamily.InterNetwork });
-            var renamed = Lab(); renamed.Name = "Bench";
-            var wifi = Wifi(); wifi.Name = "WLAN";
-            True(Planner.Learn(st, Snap(wifi, renamed), s => { }), "rename detected");
-            True(st.Subnets.All(s => s.NicName == "Bench") && st.Nud[0].NicName == "Bench", "subnet and NUD records renamed");
-            Eq("WLAN", st.Gateways.Single().NicName, "gateway renamed");
-        }
-
-        // ---------------------------------------------------------------- Planner.Build
-        static void TestPlanBlocksHoldsAndDisablesNud()
-        {
-            var snap = Snap(Wifi(), Lab());
-            var plan = Planner.Build(Learned(snap), snap);
-            Eq("Wi-Fi", string.Join(",", plan.Rules.Keys), "one rule, on the gateway NIC");
-            Eq("192.168.50.0/24,fd00:50::/64", string.Join(",", plan.Rules["Wi-Fi"].OrderBy(x => x)), "rule blocks both families");
-            Eq(2, plan.Held.Count, "both subnets held");
-            True(plan.Held.All(h => h.IfIndex == 2), "held on the lab NIC");
-            Eq("IPv4,IPv6", string.Join(",", plan.Nud.Select(t => Net.FamilyName(t.Family)).OrderBy(x => x)), "NUD off for both families");
-            True(plan.Nud.All(t => t.NicName == "Lab NIC" && t.IfIndex == 2), "NUD off on the lab NIC only");
-        }
-
-        static void TestProtectionSurvivesUnpluggedNic()
-        {
-            var st = Learned(Snap(Wifi(), Lab()));
-            var plan = Planner.Build(st, Snap(Wifi())); // lab NIC gone (USB adapter unplugged, or before it is up at boot)
-            Eq(2, plan.Rules["Wi-Fi"].Count, "still blocked on Wi-Fi");
-            Eq(0, plan.Held.Count, "nothing to hold");
-            Eq(0, plan.Nud.Count, "no NUD target while the NIC is absent");
-        }
-
-        static void TestStickyGatewayKeepsRuleWhileGatewayIsMissing()
-        {
-            var st = Learned(Snap(Wifi(), Lab()));
-            var wifiNoGw = Wifi(); wifiNoGw.Gw4 = wifiNoGw.Gw6 = false; // e.g. mid-reconnect
-            var plan = Planner.Build(st, Snap(wifiNoGw, Lab()));
-            True(plan.Rules.ContainsKey("Wi-Fi"), "rule kept");
-        }
-
-        static void TestSuspendedWhileAnotherNicOverlaps()
-        {
-            var st = Learned(Snap(Wifi(), Lab()));
-            var coffeeShop = Nic(1, "Wi-Fi", true, false, "192.168.50.0/24"); // same subnet as the lab, behind the gateway
-            var plan = Planner.Build(st, Snap(coffeeShop));
-            Eq(1, plan.Suspended.Count, "lab IPv4 subnet suspended");
-            True(plan.Suspended.Values.Single().Contains("Wi-Fi"), "reason names the NIC");
-            Eq("fd00:50::/64", string.Join(",", plan.Rules["Wi-Fi"]), "only the non-overlapping subnet blocked");
-        }
-
-        static void TestRuleExcludesTheGatewayNicsOwnSubnets()
-        {
-            var st = Learned(Snap(Wifi(), Lab()));
-            var labWithRouter = Lab(); labWithRouter.Gw4 = true; // the lab LAN later gets a router
-            Planner.Learn(st, Snap(Wifi(), labWithRouter), s => { });
-            var plan = Planner.Build(st, Snap(Wifi(), labWithRouter));
-            True(!plan.Rules.ContainsKey("Lab NIC"), "no rule blocks a NIC's own subnets (and never an empty rule)");
-            Eq(2, plan.Rules["Wi-Fi"].Count, "Wi-Fi still blocks them");
+            var plan = Build(Wan(), Nic(2, "Lab NIC", false, false, "192.168.50.0/24")); // IPv6 link-local only
+            Eq("Lab NIC IPv4", Targets(plan), "no IPv6 subnet, no IPv6 change");
         }
 
         // ---------------------------------------------------------------- HoldTracker
@@ -222,7 +148,7 @@ namespace LocalSubnetGuard.Tests
             var rows = new List<NeighborRow> {
                 Row("192.168.50.9", 2, NeighborState.Unreachable),
                 Row("192.168.1.9", 1, NeighborState.Unreachable),   // not protected
-                Row("192.168.50.10", 3, NeighborState.Unreachable), // right subnet, wrong NIC
+                Row("192.168.50.10", 3, NeighborState.Unreachable), // right subnet, wrong adapter
                 Row("192.168.50.11", 2, NeighborState.Reachable) };
             Eq("0", string.Join(",", t.Decide(rows, match, t0, log.Add)), "only the protected Unreachable entry is deleted");
             Eq(1, log.Count, "hold logged once");
@@ -258,7 +184,7 @@ namespace LocalSubnetGuard.Tests
         // ---------------------------------------------------------------- native layouts (read-only)
         static void TestNativeLayouts()
         {
-            // Loopback has NUD disabled on every Windows install; the other connected NICs have a readable value.
+            // Loopback has NUD disabled on every Windows install; the other connected adapters have a readable value.
             Eq(false, Nud.Get(AddressFamily.InterNetwork, NetworkInterface.LoopbackInterfaceIndex), "IPv4 loopback NUD");
             Eq(false, Nud.Get(AddressFamily.InterNetworkV6, NetworkInterface.IPv6LoopbackInterfaceIndex), "IPv6 loopback NUD");
             foreach (var n in Net.Snapshot().Nics.Where(n => n.Up && n.Index4 >= 0))
