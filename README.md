@@ -1,7 +1,7 @@
 # windisablenud: LocalSubnetGuard
 
 A small Windows service that works around **Neighbor Unreachability Detection (NUD) failover**, so
-traffic for a directly-connected subnet stays on its own network adapter and never leaks out the
+traffic for a directly-connected subnet stays on its own network adapter and reduces leaks out the
 default gateway.
 
 ## The problem
