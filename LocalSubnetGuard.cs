@@ -5,20 +5,28 @@
 // adapter and sends it to the next best route - normally the default gateway on another adapter.
 // NUD itself cannot be turned off: netsh lists a 'nud' interface parameter, but setting it to
 // disabled fails with "The parameter is incorrect". So instead, for every connected adapter without
-// a default gateway (checked per address family, IPv4 and IPv6), this service watches the neighbor
-// table: when a neighbor in one of the adapter's subnets is marked Unreachable, its entry is deleted
-// and the path cache flushed, so Windows re-resolves it on the local adapter instead of re-routing it.
-// It keeps doing that until the neighbor answers again.
+// a default gateway (checked per address family, IPv4 and IPv6):
 //
-// Everything follows the live network configuration; nothing is blocked, changed or remembered.
+//  1. Slow NUD  its NUD timers are lengthened (base reachable time 120 s, retransmit time 10 s, in the
+//               active store only, so a reboot resets them), so a neighbor that goes quiet for less than
+//               about 30 s is never marked Unreachable. The original values are put back when the
+//               service stops or the adapter gains a default gateway.
+//  2. Reset     a neighbor in one of the adapter's subnets that has not answered for half of NUD's
+//               budget (1.5 x RetransmitTime, in state Incomplete or Probe) has its entry deleted, so
+//               Windows starts over and never marks it Unreachable; its packets keep waiting on the
+//               local adapter instead of being re-routed.
+//  3. Hold      a neighbor that is marked Unreachable anyway has its entry deleted and the path cache
+//               flushed, so Windows re-resolves it on the local adapter instead of re-routing it.
+//
+// Everything follows the live network configuration; nothing is blocked or remembered.
 //
 // Build: build.cmd (uses the .NET Framework 4.x csc.exe that ships with Windows).
 //
 // Usage (elevated, except status):
 //   LocalSubnetGuard.exe install [intervalMs]   install + start as a Windows service (default 250 ms)
-//   LocalSubnetGuard.exe uninstall              stop + remove the service
-//   LocalSubnetGuard.exe run [intervalMs]       run in this console (Ctrl+C to stop)
-//   LocalSubnetGuard.exe status                 show adapters, protected subnets and their neighbors
+//   LocalSubnetGuard.exe uninstall              stop + remove the service (restores the NUD timers)
+//   LocalSubnetGuard.exe run [intervalMs]       run in this console (Ctrl+C to stop and restore the timers)
+//   LocalSubnetGuard.exe status                 show adapters, protected subnets, NUD timers and neighbors
 
 using System;
 using System.Collections.Generic;
@@ -93,9 +101,9 @@ namespace LocalSubnetGuard
 @"LocalSubnetGuard - keep connected-subnet traffic on its adapter (works around NUD failover)
 
   LocalSubnetGuard.exe install [intervalMs]   install + start the service (default 250 ms)
-  LocalSubnetGuard.exe uninstall              stop + remove the service
-  LocalSubnetGuard.exe run [intervalMs]       run in this console (Ctrl+C to stop)
-  LocalSubnetGuard.exe status                 show adapters, protected subnets and their neighbors
+  LocalSubnetGuard.exe uninstall              stop + remove the service (restores the NUD timers)
+  LocalSubnetGuard.exe run [intervalMs]       run in this console (Ctrl+C to stop and restore the timers)
+  LocalSubnetGuard.exe status                 show adapters, protected subnets, NUD timers and neighbors
 
 Log: " + Log.PathName);
         }
@@ -114,7 +122,7 @@ Log: " + Log.PathName);
             g.Start();
             Log.Write("Running in console. Ctrl+C to stop.");
             done.WaitOne();
-            g.Stop();
+            g.Stop(true);
             return 0;
         }
 
@@ -131,9 +139,15 @@ Log: " + Log.PathName);
                     n.Prefixes.Count == 0 ? "-" : string.Join(", ", n.Prefixes));
             }
 
-            Console.WriteLine("Protected subnets (Unreachable neighbors are held on the adapter):");
+            Console.WriteLine("Protected subnets (neighbors are kept from being marked Unreachable):");
             if (held.Count == 0) Console.WriteLine("  (none: every connected adapter has a default gateway)");
-            foreach (var h in held) Console.WriteLine("  {0,-22} on [{1}] {2}", h.Prefix, h.IfIndex, h.NicName);
+            foreach (var h in held)
+            {
+                int b, r;
+                string timers = !NudTimers.Get(h.Prefix.Family, h.IfIndex, out b, out r) ? "unknown"
+                    : string.Format("base reachable {0} ms, retransmit {1} ms{2}", b, r, NudTimers.IsTuned(b, r) ? "" : " (the service lengthens them)");
+                Console.WriteLine("  {0,-22} on [{1}] {2}  NUD timers: {3}", h.Prefix, h.IfIndex, h.NicName, timers);
+            }
 
             Console.WriteLine("Neighbors in protected subnets:");
             foreach (var fam in Net.Families)
@@ -161,15 +175,19 @@ Log: " + Log.PathName);
             _g = new Guard(intervalMs);
         }
         protected override void OnStart(string[] args) { _g.Start(); }
-        protected override void OnStop() { _g.Stop(); }
-        protected override void OnShutdown() { _g.Stop(); }
+        protected override void OnStop() { _g.Stop(true); }
+        protected override void OnShutdown() { _g.Stop(false); } // the active-store timers reset at reboot anyway
     }
 
     // ------------------------------------------------------------------ core loop
     class Guard
     {
+        class Tuned { public string NicId, NicName; public AddressFamily Family; public int OrigBase, OrigRetransmit; }
+
         readonly int _intervalMs;
         readonly HoldTracker _hold4 = new HoldTracker(), _hold6 = new HoldTracker();
+        readonly Dictionary<string, Tuned> _tuned = new Dictionary<string, Tuned>(); // adapter id|family -> original timers
+        readonly HashSet<string> _tuneFailures = new HashSet<string>();
         List<HeldSubnet> _held = new List<HeldSubnet>();
         string _lastSig;
         volatile bool _refresh = true;
@@ -190,12 +208,23 @@ Log: " + Log.PathName);
             _thread.Start();
         }
 
-        public void Stop()
+        // With restoreTimers, NUD timers go back to their original values on every adapter still present.
+        public void Stop(bool restoreTimers)
         {
             NetworkChange.NetworkAddressChanged -= OnNetChange;
             NetworkChange.NetworkAvailabilityChanged -= OnNetAvailability;
             _stop.Set();
             if (_thread != null) _thread.Join(5000);
+            if (restoreTimers)
+            {
+                var snap = Net.Snapshot();
+                foreach (var t in _tuned.Values)
+                {
+                    var nic = snap.Find(t.NicId);
+                    if (nic != null && nic.Index(t.Family) >= 0) RestoreTimers(t, nic.Index(t.Family));
+                }
+                _tuned.Clear();
+            }
             Log.Write("Stopped.");
         }
 
@@ -223,7 +252,14 @@ Log: " + Log.PathName);
 
         void Refresh()
         {
-            var held = Planner.Build(Net.Snapshot());
+            var snap = Net.Snapshot();
+            var held = Planner.Build(snap);
+            ApplyTimers(snap, held);
+            foreach (var h in held)
+            {
+                int b, r;
+                if (NudTimers.Get(h.Prefix.Family, h.IfIndex, out b, out r)) h.SetResetAfter(r);
+            }
             string sig = string.Join(", ", held.Select(h => h.Prefix + " on '" + h.NicName + "'"));
             if (sig != _lastSig)
             {
@@ -231,6 +267,56 @@ Log: " + Log.PathName);
                 Log.Write(sig == "" ? "Nothing to protect: every connected adapter has a default gateway." : "Protecting " + sig + ".");
             }
             _held = held;
+        }
+
+        // Lengthens the NUD timers of every protected (adapter, family), and puts the originals back on
+        // adapters that no longer qualify. Adapters that are not present keep their entry until they return.
+        void ApplyTimers(NetSnapshot snap, List<HeldSubnet> held)
+        {
+            var targets = held.GroupBy(h => h.NicId + "|" + Net.FamilyName(h.Prefix.Family)).ToDictionary(g => g.Key, g => g.First());
+            foreach (var kv in targets)
+            {
+                var h = kv.Value;
+                var fam = h.Prefix.Family;
+                int b, r;
+                if (!NudTimers.Get(fam, h.IfIndex, out b, out r)) continue;
+                if (!_tuned.ContainsKey(kv.Key))
+                {
+                    // Already at our values means an earlier run was not stopped cleanly: its originals are unknown,
+                    // so assume the Windows defaults.
+                    bool leftover = NudTimers.IsTuned(b, r);
+                    _tuned[kv.Key] = new Tuned { NicId = h.NicId, NicName = h.NicName, Family = fam,
+                        OrigBase = leftover ? NudTimers.DefaultBaseReachableMs : b, OrigRetransmit = leftover ? NudTimers.DefaultRetransmitMs : r };
+                }
+                if (NudTimers.IsTuned(b, r)) continue;
+
+                string err = NudTimers.Set(fam, h.IfIndex, NudTimers.TunedBaseReachableMs, NudTimers.TunedRetransmitMs);
+                if (err == null)
+                {
+                    _tuneFailures.Remove(kv.Key);
+                    Log.Write(string.Format("NUD timers on '{0}' ({1}) lengthened to base reachable {2} ms, retransmit {3} ms (were {4} / {5} ms).",
+                        h.NicName, Net.FamilyName(fam), NudTimers.TunedBaseReachableMs, NudTimers.TunedRetransmitMs, b, r));
+                }
+                else if (_tuneFailures.Add(kv.Key))
+                    Log.Write(string.Format("ERROR: could not lengthen NUD timers on '{0}' ({1}): {2}", h.NicName, Net.FamilyName(fam), err));
+            }
+            foreach (var key in _tuned.Keys.ToList())
+            {
+                if (targets.ContainsKey(key)) continue;
+                var t = _tuned[key];
+                var nic = snap.Find(t.NicId);
+                if (nic == null || nic.Index(t.Family) < 0) continue;
+                RestoreTimers(t, nic.Index(t.Family));
+                _tuned.Remove(key);
+            }
+        }
+
+        static void RestoreTimers(Tuned t, int ifIndex)
+        {
+            string err = NudTimers.Set(t.Family, ifIndex, t.OrigBase, t.OrigRetransmit);
+            Log.Write(err == null
+                ? string.Format("NUD timers on '{0}' ({1}) restored to base reachable {2} ms, retransmit {3} ms.", t.NicName, Net.FamilyName(t.Family), t.OrigBase, t.OrigRetransmit)
+                : string.Format("ERROR: could not restore NUD timers on '{0}' ({1}): {2}", t.NicName, Net.FamilyName(t.Family), err));
         }
 
         void Tick()
@@ -241,71 +327,106 @@ Log: " + Log.PathName);
                 var held = all.Where(h => h.Prefix.Family == fam).ToList();
                 var tracker = fam == AddressFamily.InterNetwork ? _hold4 : _hold6;
                 if (held.Count == 0 && tracker.Count == 0) continue;
-                int deleted = 0;
+                bool flush = false;
                 Neighbors.Scan(fam, rows =>
                 {
-                    var del = tracker.Decide(rows, r => { var h = Planner.Match(held, r); return h == null ? null : h.NicName; },
-                                             DateTime.UtcNow, Log.Write);
-                    deleted = del.Count;
-                    return del;
+                    var d = tracker.Decide(rows, r => Planner.Match(held, r), DateTime.UtcNow, Log.Write);
+                    flush = d.Flush;
+                    return d.Delete;
                 });
-                if (deleted > 0) Neighbors.FlushPathCache(fam);
+                if (flush) Neighbors.FlushPathCache(fam);
             }
         }
     }
 
-    // Tracks neighbors in protected subnets that NUD marked Unreachable. Each pass it returns the
-    // entries to delete; a neighbor is released when it answers again, and forgotten once it has not
-    // been marked Unreachable for Expiry (no more traffic to it).
+    // Keeps NUD from ever giving up on a neighbor in a protected subnet. Windows marks a neighbor
+    // Unreachable after about 3 x RetransmitTime of unanswered solicitations (state Incomplete) or probes
+    // (state Probe); until then its packets wait on the local adapter. So a neighbor that has been in one
+    // of those states for the subnet's ResetAfter (1.5 x RetransmitTime) has its entry deleted: Windows
+    // starts over with a fresh countdown and never reaches Unreachable. A neighbor that is marked
+    // Unreachable anyway is deleted too, and the caller flushes the path cache (it may already point at
+    // the gateway). An episode ends when the neighbor answers, or after Expiry with nothing to do (no
+    // more traffic to it).
     class HoldTracker
     {
-        class Entry { public string Nic; public DateTime Since, LastHeld; public int Holds; }
+        class Episode { public string Nic; public DateTime Since, LastAction; public int Resets, Holds; }
+
+        public class Decision { public List<int> Delete = new List<int>(); public bool Flush; }
 
         public static readonly TimeSpan Expiry = TimeSpan.FromSeconds(60);
-        readonly Dictionary<string, Entry> _held = new Dictionary<string, Entry>();
+        readonly Dictionary<string, DateTime> _waiting = new Dictionary<string, DateTime>(); // key -> first seen Incomplete/Probe
+        readonly Dictionary<string, Episode> _episodes = new Dictionary<string, Episode>();
 
-        public int Count { get { return _held.Count; } }
+        public int Count { get { return _waiting.Count + _episodes.Count; } }
 
-        public List<int> Decide(IList<NeighborRow> rows, Func<NeighborRow, string> protectingNic, DateTime now, Action<string> log)
+        public Decision Decide(IList<NeighborRow> rows, Func<NeighborRow, HeldSubnet> protecting, DateTime now, Action<string> log)
         {
-            var delete = new List<int>();
+            var d = new Decision();
+            var stillWaiting = new HashSet<string>();
             for (int i = 0; i < rows.Count; i++)
             {
                 var r = rows[i];
-                string nic = protectingNic(r);
-                if (nic == null) continue;
-                Entry e;
-                _held.TryGetValue(r.Key, out e);
-                if (r.State == NeighborState.Unreachable)
+                var h = protecting(r);
+                if (h == null) continue;
+                if (r.State == NeighborState.Incomplete || r.State == NeighborState.Probe)
                 {
-                    if (e == null)
-                    {
-                        _held[r.Key] = e = new Entry { Nic = nic, Since = now };
-                        log(string.Format("{0} marked Unreachable on '{1}' - holding it on the local adapter", r.Address, nic));
-                    }
-                    e.LastHeld = now;
-                    e.Holds++;
-                    delete.Add(i);
+                    DateTime start;
+                    if (!_waiting.TryGetValue(r.Key, out start)) _waiting[r.Key] = start = now;
+                    if (now - start < h.ResetAfter) { stillWaiting.Add(r.Key); continue; }
+                    d.Delete.Add(i);
+                    Touch(r, h, now, log, "{0} is not answering on '{1}' - resetting its entry so it is never marked Unreachable").Resets++;
                 }
-                else if (e != null && (r.State == NeighborState.Reachable || r.State == NeighborState.Stale || r.State == NeighborState.Permanent))
+                else if (r.State == NeighborState.Unreachable)
                 {
-                    log(string.Format("{0} answered on '{1}' ({2}) after {3:0.0}s, held {4} time(s)",
-                        r.Address, e.Nic, r.State, (now - e.Since).TotalSeconds, e.Holds));
-                    _held.Remove(r.Key);
+                    d.Delete.Add(i);
+                    d.Flush = true;
+                    log(string.Format("{0} was marked Unreachable on '{1}' - holding it on the local adapter", r.Address, h.NicName));
+                    Touch(r, h, now, log, null).Holds++;
+                }
+                else if (r.State == NeighborState.Reachable || r.State == NeighborState.Stale || r.State == NeighborState.Permanent)
+                {
+                    Episode e;
+                    if (_episodes.TryGetValue(r.Key, out e))
+                    {
+                        log(string.Format("{0} answered on '{1}' ({2}) after {3:0.0}s (reset {4}, held {5} time(s))",
+                            r.Address, e.Nic, r.State, (now - e.Since).TotalSeconds, e.Resets, e.Holds));
+                        _episodes.Remove(r.Key);
+                    }
                 }
             }
-            foreach (var kv in _held.Where(kv => now - kv.Value.LastHeld > Expiry).ToList())
+            // A countdown ends when the entry leaves Incomplete/Probe, is deleted, or disappears.
+            foreach (var key in _waiting.Keys.Where(k => !stillWaiting.Contains(k)).ToList()) _waiting.Remove(key);
+            foreach (var kv in _episodes.Where(kv => now - kv.Value.LastAction > Expiry).ToList())
             {
                 log(string.Format("{0} on '{1}' has had no traffic for {2:0}s; no longer tracking it",
                     kv.Key.Substring(0, kv.Key.IndexOf('%')), kv.Value.Nic, Expiry.TotalSeconds));
-                _held.Remove(kv.Key);
+                _episodes.Remove(kv.Key);
             }
-            return delete;
+            return d;
+        }
+
+        // Starts an episode (logging firstMessage, if any) or continues it.
+        Episode Touch(NeighborRow r, HeldSubnet h, DateTime now, Action<string> log, string firstMessage)
+        {
+            Episode e;
+            if (!_episodes.TryGetValue(r.Key, out e))
+            {
+                _episodes[r.Key] = e = new Episode { Nic = h.NicName, Since = now };
+                if (firstMessage != null) log(string.Format(firstMessage, r.Address, h.NicName));
+            }
+            e.LastAction = now;
+            return e;
         }
     }
 
     // ------------------------------------------------------------------ planning (pure; unit tested)
-    class HeldSubnet { public Prefix Prefix; public int IfIndex; public string NicName; }
+    class HeldSubnet
+    {
+        public Prefix Prefix; public int IfIndex; public string NicId, NicName;
+        public TimeSpan ResetAfter = TimeSpan.FromMilliseconds(1.5 * NudTimers.DefaultRetransmitMs); // set from the adapter's timers
+
+        public void SetResetAfter(int retransmitMs) { ResetAfter = TimeSpan.FromMilliseconds(1.5 * retransmitMs); }
+    }
 
     static class Planner
     {
@@ -319,7 +440,7 @@ Log: " + Log.PathName);
                 {
                     int idx = n.Index(p.Family);
                     if (idx >= 0 && !n.HasGateway(p.Family))
-                        held.Add(new HeldSubnet { Prefix = p, IfIndex = idx, NicName = n.Name });
+                        held.Add(new HeldSubnet { Prefix = p, IfIndex = idx, NicId = n.Id, NicName = n.Name });
                 }
             return held;
         }
@@ -404,6 +525,7 @@ Log: " + Log.PathName);
     class NetSnapshot
     {
         public List<NicInfo> Nics = new List<NicInfo>();
+        public NicInfo Find(string id) { return Nics.FirstOrDefault(n => string.Equals(n.Id, id, StringComparison.OrdinalIgnoreCase)); }
     }
 
     static class Net
@@ -444,6 +566,59 @@ Log: " + Log.PathName);
                 snap.Nics.Add(n);
             }
             return snap;
+        }
+    }
+
+    // ------------------------------------------------------------------ NUD timers
+    // Windows marks a neighbor Unreachable after its unicast probes (sent RetransmitTime apart) go
+    // unanswered. Lengthening RetransmitTime and BaseReachableTime means a neighbor has to be silent for
+    // much longer - and is probed much less often - before that happens.
+    static class NudTimers
+    {
+        public const int TunedBaseReachableMs = 120000, TunedRetransmitMs = 10000;
+        public const int DefaultBaseReachableMs = 30000, DefaultRetransmitMs = 1000;
+
+        // MIB_IPINTERFACE_ROW (168 bytes): Family @0, InterfaceLuid @8, InterfaceIndex @16, ...,
+        //   BaseReachableTime @60, RetransmitTime @64, ...
+        const int RowSize = 168, OffIndex = 16, OffBaseReachable = 60, OffRetransmit = 64;
+
+        [DllImport("iphlpapi.dll")] static extern void InitializeIpInterfaceEntry(IntPtr row);
+        [DllImport("iphlpapi.dll")] static extern int GetIpInterfaceEntry(IntPtr row);
+
+        public static bool IsTuned(int baseReachable, int retransmit)
+        {
+            return baseReachable == TunedBaseReachableMs && retransmit == TunedRetransmitMs;
+        }
+
+        public static bool Get(AddressFamily f, int ifIndex, out int baseReachable, out int retransmit)
+        {
+            baseReachable = retransmit = 0;
+            IntPtr row = Marshal.AllocHGlobal(RowSize);
+            try
+            {
+                InitializeIpInterfaceEntry(row);
+                Marshal.WriteInt16(row, 0, (short)Net.Af(f));
+                Marshal.WriteInt32(row, OffIndex, ifIndex);
+                if (GetIpInterfaceEntry(row) != 0) return false;
+                baseReachable = Marshal.ReadInt32(row, OffBaseReachable);
+                retransmit = Marshal.ReadInt32(row, OffRetransmit);
+                return true;
+            }
+            finally { Marshal.FreeHGlobal(row); }
+        }
+
+        // Sets both timers in the active store only (they reset at reboot) and reads them back.
+        // Returns null on success, else what went wrong.
+        public static string Set(AddressFamily f, int ifIndex, int baseReachable, int retransmit)
+        {
+            string output;
+            int rc = Setup.Run("netsh.exe", string.Format("interface {0} set interface {1} basereachabletime={2} retransmittime={3} store=active",
+                Net.FamilyName(f).ToLowerInvariant(), ifIndex, baseReachable, retransmit), out output);
+            if (rc != 0) return string.Format("netsh exit {0}: {1}", rc, output.Trim());
+            int b, r;
+            if (!Get(f, ifIndex, out b, out r) || b != baseReachable || r != retransmit)
+                return string.Format("netsh reported success but the timers are {0} / {1} ms", b, r);
+            return null;
         }
     }
 
@@ -538,15 +713,22 @@ Log: " + Log.PathName);
         // Runs a tool and returns its exit code. Its output is shown if it fails (unless showFailure is false).
         static int Run(string file, string args, bool showFailure = true)
         {
+            string output;
+            int rc = Run(file, args, out output);
+            if (rc != 0 && showFailure)
+                Console.Error.WriteLine("{0} {1} failed (exit {2}):{3}{4}", file, args, rc, Environment.NewLine, output.Trim());
+            return rc;
+        }
+
+        public static int Run(string file, string args, out string output)
+        {
             var psi = new ProcessStartInfo(file, args) { UseShellExecute = false, CreateNoWindow = true,
                 RedirectStandardOutput = true, RedirectStandardError = true };
             using (var p = Process.Start(psi))
             {
                 var err = p.StandardError.ReadToEndAsync(); // read both streams concurrently so neither can fill up and block
-                string output = p.StandardOutput.ReadToEnd() + err.Result;
+                output = p.StandardOutput.ReadToEnd() + err.Result;
                 p.WaitForExit();
-                if (p.ExitCode != 0 && showFailure)
-                    Console.Error.WriteLine("{0} {1} failed (exit {2}):{3}{4}", file, args, p.ExitCode, Environment.NewLine, output.Trim());
                 return p.ExitCode;
             }
         }
