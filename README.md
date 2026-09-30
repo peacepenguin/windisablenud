@@ -1,8 +1,8 @@
 # windisablenud: LocalSubnetGuard
 
-A small Windows service that **disables Neighbor Unreachability Detection (NUD)** on network adapters
-that have no default gateway. Traffic for their directly-connected subnets then stays on them instead
-of failing over to the default gateway on another adapter.
+A small Windows service that works around **Neighbor Unreachability Detection (NUD) failover**, so
+traffic for a directly-connected subnet stays on its own network adapter and never leaks out the
+default gateway.
 
 ## The problem
 
@@ -19,22 +19,23 @@ as unusable and sends traffic for that address to the next best route, the defau
 The packets leak onto the wrong network. Connections break, and they often stay broken after the device
 comes back, because Windows keeps using the cached path.
 
+NUD itself cannot be turned off. `netsh interface ipv4 set interface` lists a `nud` parameter, but
+setting it to `disabled` always fails with "The parameter is incorrect".
+
 ## What it does
 
-The service acts on every connected adapter that has **no default gateway**, checked separately for
-IPv4 and IPv6:
+The service watches the neighbor table of every connected adapter that has **no default gateway**,
+checked separately for IPv4 and IPv6. When a neighbor in one of that adapter's subnets is marked
+Unreachable, the service deletes the entry and flushes the path cache. Windows then re-resolves the
+address on the local adapter instead of re-routing it to the gateway. The service keeps doing this
+until the neighbor answers again, and logs when a device is held and when it comes back.
 
-1. **NUD off.** Neighbor Unreachability Detection is turned off on the adapter (the same setting as
-   `netsh interface ipv4 set interface <adapter> nud=disabled`). Its neighbors are not marked Unreachable,
-   so Windows never moves their traffic to the gateway.
-2. **Hold (backstop).** If a neighbor on that adapter is marked Unreachable anyway, its entry is deleted
-   and the path cache is flushed. Windows re-resolves the address on the local adapter instead of
-   re-routing it. The service checks every 250 ms by default and logs when the neighbor answers again.
+It checks every 250 ms by default. The set of protected subnets follows the live network configuration,
+re-checked on every address change and every 5 seconds. Nothing is blocked, no setting is changed and no
+network is remembered. The only thing written to disk is the log.
 
-Nothing is blocked and no network is remembered: the service follows the live configuration, re-checking
-on every address change and every 5 seconds. If an adapter gains a default gateway, NUD is turned back on
-there right away. The only thing saved is the list of adapters the service turned NUD off on
-(`%ProgramData%\LocalSubnetGuard\state.txt`), so `uninstall` can turn it back on.
+Between a neighbor being marked Unreachable and the next check, some traffic can still go out the
+gateway: up to one interval (250 ms by default).
 
 ## Usage
 
@@ -42,32 +43,30 @@ Build with `build.cmd`, or download the exe from the CI artifacts. Then, from an
 
 ```
 LocalSubnetGuard.exe install [intervalMs]   install + start the service (default 250 ms)
-LocalSubnetGuard.exe uninstall              remove the service and turn NUD back on
-LocalSubnetGuard.exe run [intervalMs]       run in this console; NUD is turned back on at exit
-LocalSubnetGuard.exe status                 show adapters, NUD settings and neighbors
+LocalSubnetGuard.exe uninstall              stop + remove the service
+LocalSubnetGuard.exe run [intervalMs]       run in this console (Ctrl+C to stop)
+LocalSubnetGuard.exe status                 show adapters, protected subnets and their neighbors
 ```
 
 `install` copies the exe to `%ProgramFiles%\LocalSubnetGuard` and registers an auto-start service that
-restarts on failure. It also removes leftovers of earlier versions: the PowerShell scheduled task, and
-Windows Firewall rules in the `LocalSubnetGuard` group. Stopping the service leaves NUD off.
-`status` works without elevation.
+restarts on failure. It also removes leftovers of earlier versions: the PowerShell scheduled task,
+Windows Firewall rules in the `LocalSubnetGuard` group, and the old state file. `status` works without
+elevation.
 
 The log is at `%ProgramData%\LocalSubnetGuard\LocalSubnetGuard.log` and rotates at 1 MB. Only SYSTEM and
 Administrators can write to that folder.
 
 ## Things to know
 
-- **Uninstall turns NUD back on** only on adapters that are present at the time. For an absent adapter,
-  the log prints the `netsh` command to run later.
-- **Some adapters and addresses are ignored:** loopback, transition tunnels (Teredo, 6to4, ISATAP,
-  IP-HTTPS), link-local addresses and host-only prefixes (IPv4 /32, IPv6 /128). An adapter whose only
-  IPv6 addresses are DHCPv6 /128s therefore keeps IPv6 NUD on.
+Some adapters and addresses are ignored: loopback, transition tunnels (Teredo, 6to4, ISATAP, IP-HTTPS),
+link-local addresses and host-only prefixes (IPv4 /32, IPv6 /128). An adapter whose only IPv6 addresses
+are DHCPv6 /128s therefore has no protected IPv6 subnet.
 
 ## Development
 
 - One source file, [LocalSubnetGuard.cs](LocalSubnetGuard.cs), written in C# 5 so it compiles with the
   `csc.exe` built into Windows (.NET Framework 4.x). No SDK is needed.
 - `build.cmd` builds `bin\LocalSubnetGuard.exe` and runs the tests in [tests/Tests.cs](tests/Tests.cs).
-  They cover which adapters get NUD off, the hold/release tracker, state round-tripping, and a read-only
-  check of the native struct layouts.
+  They cover which subnets are protected, the hold/release tracker, address handling, and a read-only
+  check of the neighbor-table layout.
 - GitHub Actions runs the same script on every push and uploads the exe as an artifact.

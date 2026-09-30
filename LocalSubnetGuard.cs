@@ -1,28 +1,24 @@
-// LocalSubnetGuard - disables Neighbor Unreachability Detection (NUD) on network adapters that have no
-// default gateway, so traffic for their directly-connected subnets stays on them instead of failing
-// over to the default gateway on another adapter.
+// LocalSubnetGuard - works around Neighbor Unreachability Detection (NUD) failover, so traffic for
+// directly-connected subnets stays on their adapter instead of leaking to the default gateway.
 //
 // Windows treats an on-link destination whose neighbor entry is Unreachable as unroutable on that
-// adapter and sends it to the next best route - normally the default gateway on another adapter. For
-// every connected adapter without a default gateway (checked per address family, IPv4 and IPv6):
+// adapter and sends it to the next best route - normally the default gateway on another adapter.
+// NUD itself cannot be turned off: netsh lists a 'nud' interface parameter, but setting it to
+// disabled fails with "The parameter is incorrect". So instead, for every connected adapter without
+// a default gateway (checked per address family, IPv4 and IPv6), this service watches the neighbor
+// table: when a neighbor in one of the adapter's subnets is marked Unreachable, its entry is deleted
+// and the path cache flushed, so Windows re-resolves it on the local adapter instead of re-routing it.
+// It keeps doing that until the neighbor answers again.
 //
-//  1. NUD off  NeighborUnreachabilityDetection is disabled on the adapter, so its neighbors are not
-//              marked Unreachable in the first place.
-//  2. Hold     a neighbor on that adapter that is marked Unreachable anyway has its entry deleted and
-//              the path cache flushed, so Windows re-resolves it on the local adapter instead of
-//              re-routing it.
-//
-// Everything follows the live network configuration: nothing is blocked and nothing is remembered
-// except which adapters the service turned NUD off on (%ProgramData%\LocalSubnetGuard\state.txt), so
-// 'uninstall' can turn it back on. An adapter that gains a default gateway gets NUD back right away.
+// Everything follows the live network configuration; nothing is blocked, changed or remembered.
 //
 // Build: build.cmd (uses the .NET Framework 4.x csc.exe that ships with Windows).
 //
 // Usage (elevated, except status):
 //   LocalSubnetGuard.exe install [intervalMs]   install + start as a Windows service (default 250 ms)
-//   LocalSubnetGuard.exe uninstall              remove the service and turn NUD back on
-//   LocalSubnetGuard.exe run [intervalMs]       run in this console; NUD is turned back on at exit
-//   LocalSubnetGuard.exe status                 show adapters, NUD settings and neighbors
+//   LocalSubnetGuard.exe uninstall              stop + remove the service
+//   LocalSubnetGuard.exe run [intervalMs]       run in this console (Ctrl+C to stop)
+//   LocalSubnetGuard.exe status                 show adapters, protected subnets and their neighbors
 
 using System;
 using System.Collections.Generic;
@@ -37,7 +33,6 @@ using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.ServiceProcess;
-using System.Text;
 using System.Threading;
 
 namespace LocalSubnetGuard
@@ -95,12 +90,12 @@ namespace LocalSubnetGuard
         static void Help()
         {
             Console.WriteLine(
-@"LocalSubnetGuard - disable NUD on adapters without a default gateway, so their traffic never fails over
+@"LocalSubnetGuard - keep connected-subnet traffic on its adapter (works around NUD failover)
 
   LocalSubnetGuard.exe install [intervalMs]   install + start the service (default 250 ms)
-  LocalSubnetGuard.exe uninstall              remove the service and turn NUD back on
-  LocalSubnetGuard.exe run [intervalMs]       run in this console; NUD is turned back on at exit
-  LocalSubnetGuard.exe status                 show adapters, NUD settings and neighbors
+  LocalSubnetGuard.exe uninstall              stop + remove the service
+  LocalSubnetGuard.exe run [intervalMs]       run in this console (Ctrl+C to stop)
+  LocalSubnetGuard.exe status                 show adapters, protected subnets and their neighbors
 
 Log: " + Log.PathName);
         }
@@ -113,21 +108,20 @@ Log: " + Log.PathName);
                 return 1;
             }
             Log.Echo = true;
-            ConsoleExit.Install();
             var g = new Guard(intervalMs);
+            var done = new ManualResetEvent(false);
+            Console.CancelKeyPress += (s, e) => { e.Cancel = true; done.Set(); };
             g.Start();
-            Log.Write("Running in console. Ctrl+C to stop; NUD is turned back on at exit.");
-            ConsoleExit.Requested.WaitOne();
+            Log.Write("Running in console. Ctrl+C to stop.");
+            done.WaitOne();
             g.Stop();
-            Guard.RestoreAll();
-            ConsoleExit.Done.Set();
             return 0;
         }
 
         static int Status()
         {
             var snap = Net.Snapshot();
-            var plan = Planner.Build(snap);
+            var held = Planner.Build(snap);
 
             Console.WriteLine("Connected adapters:");
             foreach (var n in snap.Nics.Where(n => n.Up))
@@ -137,25 +131,14 @@ Log: " + Log.PathName);
                     n.Prefixes.Count == 0 ? "-" : string.Join(", ", n.Prefixes));
             }
 
-            Console.WriteLine("Protected (NUD off, Unreachable neighbors held):");
-            if (plan.Nud.Count == 0) Console.WriteLine("  (none: every connected adapter has a default gateway)");
-            foreach (var t in plan.Nud)
-            {
-                bool? on = Nud.Get(t.Family, t.IfIndex);
-                var subnets = plan.Held.Where(h => h.IfIndex == t.IfIndex && h.Prefix.Family == t.Family).Select(h => h.Prefix.ToString());
-                Console.WriteLine("  [{0}] {1} {2}  {3}  NUD: {4}", t.IfIndex, t.NicName, Net.FamilyName(t.Family), string.Join(", ", subnets),
-                    on == null ? "unknown" : on.Value ? "enabled (the service turns it off)" : "off");
-            }
-
-            var st = StateStore.Load();
-            foreach (var r in st.Nud.Where(r => !plan.Nud.Any(t => Net.SameId(t.NicId, r.NicId) && t.Family == r.Family)))
-                Console.WriteLine("  '{0}' {1}: NUD was turned off by the service; it is turned back on when the adapter is connected",
-                    r.NicName, Net.FamilyName(r.Family));
+            Console.WriteLine("Protected subnets (Unreachable neighbors are held on the adapter):");
+            if (held.Count == 0) Console.WriteLine("  (none: every connected adapter has a default gateway)");
+            foreach (var h in held) Console.WriteLine("  {0,-22} on [{1}] {2}", h.Prefix, h.IfIndex, h.NicName);
 
             Console.WriteLine("Neighbors in protected subnets:");
             foreach (var fam in Net.Families)
                 foreach (var n in Neighbors.Read(fam))
-                    if (Planner.Match(plan.Held, n) != null)
+                    if (Planner.Match(held, n) != null)
                         Console.WriteLine("  {0,-28} [{1}] {2}", n.Address, n.IfIndex, n.State);
 
             if (Setup.ServiceExists())
@@ -163,30 +146,6 @@ Log: " + Log.PathName);
             else
                 Console.WriteLine("Service: not installed");
             return 0;
-        }
-    }
-
-    // Console-mode shutdown: Ctrl+C / Ctrl+Break, and also closing the window, logoff and shutdown,
-    // which Console.CancelKeyPress does not see. For the latter Windows ends the process as soon as the
-    // handler returns, so the handler waits for cleanup to finish.
-    static class ConsoleExit
-    {
-        delegate bool HandlerRoutine(int ctrlType);
-        [DllImport("kernel32.dll")] static extern bool SetConsoleCtrlHandler(HandlerRoutine handler, bool add);
-
-        static HandlerRoutine _handler; // keep the delegate alive
-        public static readonly ManualResetEvent Requested = new ManualResetEvent(false);
-        public static readonly ManualResetEvent Done = new ManualResetEvent(false);
-
-        public static void Install()
-        {
-            _handler = type =>
-            {
-                Requested.Set();
-                if (type >= 2) Done.WaitOne(10000); // CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT
-                return true;
-            };
-            SetConsoleCtrlHandler(_handler, true);
         }
     }
 
@@ -211,8 +170,7 @@ Log: " + Log.PathName);
     {
         readonly int _intervalMs;
         readonly HoldTracker _hold4 = new HoldTracker(), _hold6 = new HoldTracker();
-        readonly HashSet<string> _nudFailures = new HashSet<string>();
-        Plan _plan = new Plan();
+        List<HeldSubnet> _held = new List<HeldSubnet>();
         string _lastSig;
         volatile bool _refresh = true;
         DateTime _nextRefresh = DateTime.MinValue;
@@ -225,14 +183,13 @@ Log: " + Log.PathName);
         {
             Log.Write(string.Format("Starting (interval {0} ms).", _intervalMs));
             DataDir.Secure();
-            LegacyFirewallRules.Remove();
+            Legacy.Cleanup();
             NetworkChange.NetworkAddressChanged += OnNetChange;
             NetworkChange.NetworkAvailabilityChanged += OnNetAvailability;
             _thread = new Thread(Loop) { IsBackground = true, Name = "LocalSubnetGuard" };
             _thread.Start();
         }
 
-        // Stops the loop only: NUD stays off, so protection holds across service restarts and reboots.
         public void Stop()
         {
             NetworkChange.NetworkAddressChanged -= OnNetChange;
@@ -266,69 +223,22 @@ Log: " + Log.PathName);
 
         void Refresh()
         {
-            var snap = Net.Snapshot();
-            var plan = Planner.Build(snap);
-            var st = StateStore.Load();
-            if (ApplyNud(st, snap, plan)) StateStore.Save(st);
-
-            string sig = string.Join(", ", plan.Held.Select(h => h.Prefix + " on '" + h.NicName + "'"));
+            var held = Planner.Build(Net.Snapshot());
+            string sig = string.Join(", ", held.Select(h => h.Prefix + " on '" + h.NicName + "'"));
             if (sig != _lastSig)
             {
                 _lastSig = sig;
                 Log.Write(sig == "" ? "Nothing to protect: every connected adapter has a default gateway." : "Protecting " + sig + ".");
             }
-            _plan = plan;
-        }
-
-        // Turns NUD off where the plan wants it off, and back on where we turned it off and the adapter is
-        // connected but no longer qualifies (it gained a default gateway, or lost its addresses). Adapters
-        // that are disconnected or absent are left alone. Returns true if st changed.
-        bool ApplyNud(State st, NetSnapshot snap, Plan plan)
-        {
-            bool dirty = false;
-            foreach (var t in plan.Nud)
-            {
-                if (Nud.Get(t.Family, t.IfIndex) != true) continue;
-                if (st.FindNud(t.NicId, t.Family) == null)
-                {
-                    st.Nud.Add(new NudRecord { NicId = t.NicId, NicName = t.NicName, Family = t.Family });
-                    StateStore.Save(st); // record it before changing it, so uninstall can always undo it
-                }
-                int rc = Nud.Set(t.Family, t.IfIndex, false);
-                string key = t.NicId + Net.FamilyName(t.Family);
-                if (rc == 0) { _nudFailures.Remove(key); Log.Write(string.Format("NUD turned off on '{0}' ({1}).", t.NicName, Net.FamilyName(t.Family))); }
-                else if (_nudFailures.Add(key)) Log.Write(string.Format("ERROR: could not turn off NUD on '{0}' ({1}): error {2}.", t.NicName, Net.FamilyName(t.Family), rc));
-            }
-            foreach (var r in st.Nud.ToList())
-            {
-                if (plan.Nud.Any(t => Net.SameId(t.NicId, r.NicId) && t.Family == r.Family)) continue;
-                var nic = snap.Find(r.NicId);
-                if (nic == null || !nic.Up || nic.Index(r.Family) < 0) continue;
-                RestoreNud(r, nic.Index(r.Family));
-                st.Nud.Remove(r);
-                dirty = true;
-            }
-            foreach (var r in st.Nud)
-            {
-                var nic = snap.Find(r.NicId);
-                if (nic != null && nic.Name != r.NicName) { r.NicName = nic.Name; dirty = true; } // follow renames
-            }
-            return dirty;
-        }
-
-        static void RestoreNud(NudRecord r, int ifIndex)
-        {
-            int rc = Nud.Set(r.Family, ifIndex, true);
-            Log.Write(rc == 0 ? string.Format("NUD turned back on on '{0}' ({1}).", r.NicName, Net.FamilyName(r.Family))
-                              : string.Format("ERROR: could not turn NUD back on on '{0}' ({1}): error {2}.", r.NicName, Net.FamilyName(r.Family), rc));
+            _held = held;
         }
 
         void Tick()
         {
-            var plan = _plan;
+            var all = _held;
             foreach (var fam in Net.Families)
             {
-                var held = plan.Held.Where(h => h.Prefix.Family == fam).ToList();
+                var held = all.Where(h => h.Prefix.Family == fam).ToList();
                 var tracker = fam == AddressFamily.InterNetwork ? _hold4 : _hold6;
                 if (held.Count == 0 && tracker.Count == 0) continue;
                 int deleted = 0;
@@ -341,28 +251,6 @@ Log: " + Log.PathName);
                 });
                 if (deleted > 0) Neighbors.FlushPathCache(fam);
             }
-        }
-
-        // Turns NUD back on everywhere the service turned it off. Adapters that are not present keep
-        // their record (console mode) or get a logged netsh command (uninstall, which deletes the state).
-        public static void RestoreAll(bool deleteState = false)
-        {
-            var st = StateStore.Load();
-            var snap = Net.Snapshot();
-            foreach (var r in st.Nud.ToList())
-            {
-                var nic = snap.Find(r.NicId);
-                int idx = nic == null ? -1 : nic.Index(r.Family);
-                if (idx < 0)
-                {
-                    Log.Write(string.Format("WARNING: '{0}' is not present, so NUD could not be turned back on. When it is back, run: " +
-                        "netsh interface {1} set interface \"{0}\" nud=enabled", r.NicName, Net.FamilyName(r.Family).ToLowerInvariant()));
-                    continue;
-                }
-                RestoreNud(r, idx);
-                st.Nud.Remove(r);
-            }
-            if (deleteState) StateStore.Delete(); else StateStore.Save(st);
         }
     }
 
@@ -417,66 +305,23 @@ Log: " + Log.PathName);
     }
 
     // ------------------------------------------------------------------ planning (pure; unit tested)
-    class NicRef { public string NicId, NicName; }
-    class NudRecord : NicRef { public AddressFamily Family; } // the service turned NUD off here and must turn it back on
-
-    class State
-    {
-        public List<NudRecord> Nud = new List<NudRecord>();
-
-        public NudRecord FindNud(string nicId, AddressFamily f)
-        {
-            return Nud.FirstOrDefault(r => Net.SameId(r.NicId, nicId) && r.Family == f);
-        }
-
-        public string Serialize()
-        {
-            var sb = new StringBuilder("# LocalSubnetGuard: adapters it turned NUD off on, so uninstall can turn it back on.\r\n");
-            foreach (var n in Nud) sb.AppendFormat("nud {0} {1} {2}\r\n", Net.FamilyName(n.Family), n.NicId, n.NicName);
-            return sb.ToString();
-        }
-
-        public static State Parse(string text)
-        {
-            var st = new State();
-            var space = new[] { ' ' };
-            foreach (var raw in text.Split('\n'))
-            {
-                string[] f = raw.Trim().Split(space, 4);
-                AddressFamily fam;
-                if (f.Length == 4 && f[0] == "nud" && Net.TryParseFamily(f[1], out fam))
-                    st.Nud.Add(new NudRecord { Family = fam, NicId = f[2], NicName = f[3] });
-            }
-            return st;
-        }
-    }
-
     class HeldSubnet { public Prefix Prefix; public int IfIndex; public string NicName; }
-    class NudTarget : NicRef { public AddressFamily Family; public int IfIndex; }
-
-    class Plan
-    {
-        public List<NudTarget> Nud = new List<NudTarget>();    // (adapter, family) pairs that get NUD off
-        public List<HeldSubnet> Held = new List<HeldSubnet>(); // their connected subnets
-    }
 
     static class Planner
     {
-        // Every connected adapter without a default gateway for a family gets NUD off for that family,
-        // and its subnets of that family are held. Built from the live configuration only.
-        public static Plan Build(NetSnapshot snap)
+        // The connected subnets of every connected adapter without a default gateway for that family.
+        // Built from the live configuration only.
+        public static List<HeldSubnet> Build(NetSnapshot snap)
         {
-            var plan = new Plan();
+            var held = new List<HeldSubnet>();
             foreach (var n in snap.Nics.Where(n => n.Up))
-                foreach (var fam in Net.Families)
+                foreach (var p in n.Prefixes)
                 {
-                    int idx = n.Index(fam);
-                    var prefixes = n.Prefixes.Where(p => p.Family == fam).ToList();
-                    if (idx < 0 || n.HasGateway(fam) || prefixes.Count == 0) continue;
-                    plan.Nud.Add(new NudTarget { NicId = n.Id, NicName = n.Name, Family = fam, IfIndex = idx });
-                    foreach (var p in prefixes) plan.Held.Add(new HeldSubnet { Prefix = p, IfIndex = idx, NicName = n.Name });
+                    int idx = n.Index(p.Family);
+                    if (idx >= 0 && !n.HasGateway(p.Family))
+                        held.Add(new HeldSubnet { Prefix = p, IfIndex = idx, NicName = n.Name });
                 }
-            return plan;
+            return held;
         }
 
         public static HeldSubnet Match(IEnumerable<HeldSubnet> held, NeighborRow n)
@@ -559,7 +404,6 @@ Log: " + Log.PathName);
     class NetSnapshot
     {
         public List<NicInfo> Nics = new List<NicInfo>();
-        public NicInfo Find(string id) { return Nics.FirstOrDefault(n => Net.SameId(n.Id, id)); }
     }
 
     static class Net
@@ -568,13 +412,6 @@ Log: " + Log.PathName);
 
         public static ushort Af(AddressFamily f) { return (ushort)(f == AddressFamily.InterNetwork ? 2 : 23); } // AF_INET, AF_INET6
         public static string FamilyName(AddressFamily f) { return f == AddressFamily.InterNetwork ? "IPv4" : "IPv6"; }
-        public static bool SameId(string a, string b) { return string.Equals(a, b, StringComparison.OrdinalIgnoreCase); }
-
-        public static bool TryParseFamily(string s, out AddressFamily f)
-        {
-            f = s.Equals("IPv4", StringComparison.OrdinalIgnoreCase) ? AddressFamily.InterNetwork : AddressFamily.InterNetworkV6;
-            return s.Equals("IPv4", StringComparison.OrdinalIgnoreCase) || s.Equals("IPv6", StringComparison.OrdinalIgnoreCase);
-        }
 
         // Every adapter except loopback and transition tunnels (Teredo, 6to4, ISATAP, IP-HTTPS).
         public static NetSnapshot Snapshot()
@@ -607,49 +444,6 @@ Log: " + Log.PathName);
                 snap.Nics.Add(n);
             }
             return snap;
-        }
-    }
-
-    // ------------------------------------------------------------------ per-adapter NUD switch (IP Helper)
-    static class Nud
-    {
-        // MIB_IPINTERFACE_ROW (168 bytes): Family @0, InterfaceLuid @8, InterfaceIndex @16, ...,
-        //   UseNeighborUnreachabilityDetection (BOOLEAN) @45, ..., SitePrefixLength @144
-        const int RowSize = 168, OffIndex = 16, OffUseNud = 45, OffSitePrefixLength = 144;
-
-        [DllImport("iphlpapi.dll")] static extern void InitializeIpInterfaceEntry(IntPtr row);
-        [DllImport("iphlpapi.dll")] static extern int GetIpInterfaceEntry(IntPtr row);
-        [DllImport("iphlpapi.dll")] static extern int SetIpInterfaceEntry(IntPtr row);
-
-        // null if the interface could not be read
-        public static bool? Get(AddressFamily f, int ifIndex)
-        {
-            IntPtr row = Marshal.AllocHGlobal(RowSize);
-            try { return Fetch(row, f, ifIndex) == 0 ? Marshal.ReadByte(row, OffUseNud) != 0 : (bool?)null; }
-            finally { Marshal.FreeHGlobal(row); }
-        }
-
-        // Returns a Win32 error code (0 = success).
-        public static int Set(AddressFamily f, int ifIndex, bool enabled)
-        {
-            IntPtr row = Marshal.AllocHGlobal(RowSize);
-            try
-            {
-                int rc = Fetch(row, f, ifIndex);
-                if (rc != 0) return rc;
-                Marshal.WriteByte(row, OffUseNud, (byte)(enabled ? 1 : 0));
-                if (f == AddressFamily.InterNetwork) Marshal.WriteInt32(row, OffSitePrefixLength, 0); // SetIpInterfaceEntry requires 0 for IPv4
-                return SetIpInterfaceEntry(row);
-            }
-            finally { Marshal.FreeHGlobal(row); }
-        }
-
-        static int Fetch(IntPtr row, AddressFamily f, int ifIndex)
-        {
-            InitializeIpInterfaceEntry(row);
-            Marshal.WriteInt16(row, 0, (short)Net.Af(f));
-            Marshal.WriteInt32(row, OffIndex, ifIndex);
-            return GetIpInterfaceEntry(row);
         }
     }
 
@@ -711,12 +505,12 @@ Log: " + Log.PathName);
     }
 
     // ------------------------------------------------------------------ cleanup of earlier versions
-    // Earlier versions added outbound Windows Firewall block rules in this group; remove any left behind.
-    static class LegacyFirewallRules
+    static class Legacy
     {
-        const string Group = "LocalSubnetGuard";
+        const string FirewallGroup = "LocalSubnetGuard";
 
-        public static void Remove()
+        // Earlier versions added outbound Windows Firewall block rules and kept a state file; remove both.
+        public static void Cleanup()
         {
             try
             {
@@ -726,12 +520,13 @@ Log: " + Log.PathName);
                 {
                     string g = null;
                     try { g = r.Grouping; } catch { }
-                    if (g == Group) names.Add((string)r.Name);
+                    if (g == FirewallGroup) names.Add((string)r.Name);
                 }
                 foreach (var name in names) pol.Rules.Remove(name);
                 if (names.Count > 0) Log.Write(string.Format("Removed {0} firewall rule(s) left by an earlier version.", names.Count));
             }
             catch (Exception ex) { Log.Write("WARNING: could not check for old firewall rules: " + ex.Message); }
+            try { File.Delete(Path.Combine(DataDir.Location, "state.txt")); } catch { }
         }
     }
 
@@ -813,7 +608,7 @@ Log: " + Log.PathName);
                 : Run("sc.exe", "create " + Program.ServiceName + " binPath= \"" + bin + "\" start= auto DisplayName= \"Local Subnet Guard\"");
             if (rc != 0) return 1;
 
-            Run("sc.exe", "description " + Program.ServiceName + " \"Disables NUD on adapters without a default gateway, so their traffic never fails over to the gateway.\"");
+            Run("sc.exe", "description " + Program.ServiceName + " \"Keeps connected-subnet traffic on its adapter; works around NUD failover to the default gateway.\"");
             Run("sc.exe", "failure " + Program.ServiceName + " reset= 86400 actions= restart/5000/restart/5000/restart/5000");
 
             using (var sc = new ServiceController(Program.ServiceName))
@@ -831,14 +626,13 @@ Log: " + Log.PathName);
             StopService();
             if (ServiceExists() && Run("sc.exe", "delete " + Program.ServiceName) != 0) return 1;
             Log.Echo = true;
-            LegacyFirewallRules.Remove();
-            Guard.RestoreAll(true);
-            Console.WriteLine("Service removed and NUD turned back on. (" + InstallDir + " left in place.)");
+            Legacy.Cleanup();
+            Console.WriteLine("Service removed. (" + InstallDir + " left in place.)");
             return 0;
         }
     }
 
-    // ------------------------------------------------------------------ %ProgramData%\LocalSubnetGuard
+    // ------------------------------------------------------------------ %ProgramData%\LocalSubnetGuard (log)
     static class DataDir
     {
         public static string Location
@@ -846,7 +640,7 @@ Log: " + Log.PathName);
             get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "LocalSubnetGuard"); }
         }
 
-        // SYSTEM and Administrators get full control, Users read-only, so non-admins cannot tamper with state or log.
+        // SYSTEM and Administrators get full control, Users read-only, so non-admins cannot tamper with the log.
         public static void Secure()
         {
             try
@@ -864,26 +658,6 @@ Log: " + Log.PathName);
             }
             catch (Exception ex) { Log.Write("WARNING: could not secure " + Location + ": " + ex.Message); }
         }
-    }
-
-    static class StateStore
-    {
-        public static string PathName { get { return Path.Combine(DataDir.Location, "state.txt"); } }
-
-        public static State Load()
-        {
-            return File.Exists(PathName) ? State.Parse(File.ReadAllText(PathName)) : new State();
-        }
-
-        public static void Save(State st)
-        {
-            Directory.CreateDirectory(DataDir.Location);
-            string tmp = PathName + ".tmp";
-            File.WriteAllText(tmp, st.Serialize());
-            if (File.Exists(PathName)) File.Replace(tmp, PathName, null); else File.Move(tmp, PathName);
-        }
-
-        public static void Delete() { File.Delete(PathName); }
     }
 
     // ------------------------------------------------------------------ logging

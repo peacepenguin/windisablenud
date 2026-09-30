@@ -40,9 +40,8 @@ namespace LocalSubnetGuard.Tests
             return new NicInfo { Id = "{" + index + "}", Name = name, Up = true, Gw4 = gw4, Gw6 = gw6, Index4 = index, Index6 = index,
                                  Prefixes = prefixes.Select(P).ToList() };
         }
-        static Plan Build(params NicInfo[] nics) { return Planner.Build(new NetSnapshot { Nics = nics.ToList() }); }
-        static string Targets(Plan p) { return string.Join(",", p.Nud.Select(t => t.NicName + " " + Net.FamilyName(t.Family)).OrderBy(x => x)); }
-        static string HeldCidrs(Plan p) { return string.Join(",", p.Held.Select(h => h.Prefix.ToString()).OrderBy(x => x)); }
+        static List<HeldSubnet> Build(params NicInfo[] nics) { return Planner.Build(new NetSnapshot { Nics = nics.ToList() }); }
+        static string Held(List<HeldSubnet> held) { return string.Join(",", held.Select(h => h.Prefix + " on " + h.NicName).OrderBy(x => x)); }
 
         // Typical PC: an adapter with the default gateway, plus a lab adapter with none.
         static NicInfo Wan() { return Nic(1, "Ethernet", true, true, "192.168.1.0/24", "2001:db8:1::/64"); }
@@ -86,52 +85,30 @@ namespace LocalSubnetGuard.Tests
             True(Prefix.OfInterfaceAddress(IPAddress.Parse("2001:db8::5"), 128) == null, "v6 host prefix");
         }
 
-        // ---------------------------------------------------------------- State
-        static void TestStateRoundTrip()
-        {
-            var st = new State();
-            st.Nud.Add(new NudRecord { NicId = "{A}", NicName = "Ethernet 2 (lab)", Family = AddressFamily.InterNetwork });
-            st.Nud.Add(new NudRecord { NicId = "{A}", NicName = "Ethernet 2 (lab)", Family = AddressFamily.InterNetworkV6 });
-            // lines written by the previous version (remembered subnets and gateways) are ignored
-            var back = State.Parse(st.Serialize() + "subnet 10.1.1.0/24 {A} Ethernet 2\ngateway {B} Ethernet\ngarbage\nnud IPv5 {C} x\n");
-            Eq(st.Serialize(), back.Serialize(), "round trip");
-            Eq("Ethernet 2 (lab)", back.Nud[0].NicName, "names with spaces");
-            Eq(AddressFamily.InterNetworkV6, back.Nud[1].Family, "family");
-        }
-
         // ---------------------------------------------------------------- Planner
         static void TestOnlyAdaptersWithoutGatewayAreProtected()
         {
-            var plan = Build(Wan(), Lab());
-            Eq("Lab NIC IPv4,Lab NIC IPv6", Targets(plan), "NUD off on the lab adapter only");
-            Eq("192.168.50.0/24,fd00:50::/64", HeldCidrs(plan), "lab subnets held");
-            True(plan.Nud.All(t => t.IfIndex == 2) && plan.Held.All(h => h.IfIndex == 2), "on the lab adapter's index");
+            var held = Build(Wan(), Lab());
+            Eq("192.168.50.0/24 on Lab NIC,fd00:50::/64 on Lab NIC", Held(held), "lab subnets only");
+            True(held.All(h => h.IfIndex == 2), "on the lab adapter's index");
         }
 
         static void TestGatewayIsCheckedPerFamily()
         {
-            // The lab LAN has an IPv6 router but no IPv4 gateway: only IPv4 NUD is turned off there.
-            var plan = Build(Wan(), Nic(2, "Lab NIC", false, true, "192.168.50.0/24", "2001:db8:50::/64"));
-            Eq("Lab NIC IPv4", Targets(plan), "per family");
-            Eq("192.168.50.0/24", HeldCidrs(plan), "only IPv4 held");
+            // The lab LAN has an IPv6 router but no IPv4 gateway: only its IPv4 subnet is protected.
+            Eq("192.168.50.0/24 on Lab NIC", Held(Build(Wan(), Nic(2, "Lab NIC", false, true, "192.168.50.0/24", "2001:db8:50::/64"))), "per family");
         }
 
         static void TestAdapterThatGainsAGatewayIsNotProtected()
         {
             var lab = Lab(); lab.Gw4 = lab.Gw6 = true;
-            Eq("", Targets(Build(Wan(), lab)), "nothing left to protect");
+            Eq("", Held(Build(Wan(), lab)), "nothing left to protect");
         }
 
         static void TestDisconnectedAdapterIsNotProtected()
         {
             var lab = Lab(); lab.Up = false;
-            Eq("", Targets(Build(Wan(), lab)), "follows the live configuration");
-        }
-
-        static void TestFamilyWithoutAddressesIsSkipped()
-        {
-            var plan = Build(Wan(), Nic(2, "Lab NIC", false, false, "192.168.50.0/24")); // IPv6 link-local only
-            Eq("Lab NIC IPv4", Targets(plan), "no IPv6 subnet, no IPv6 change");
+            Eq("", Held(Build(Wan(), lab)), "follows the live configuration");
         }
 
         // ---------------------------------------------------------------- HoldTracker
@@ -184,12 +161,6 @@ namespace LocalSubnetGuard.Tests
         // ---------------------------------------------------------------- native layouts (read-only)
         static void TestNativeLayouts()
         {
-            // Loopback has NUD disabled on every Windows install; the other connected adapters have a readable value.
-            Eq(false, Nud.Get(AddressFamily.InterNetwork, NetworkInterface.LoopbackInterfaceIndex), "IPv4 loopback NUD");
-            Eq(false, Nud.Get(AddressFamily.InterNetworkV6, NetworkInterface.IPv6LoopbackInterfaceIndex), "IPv6 loopback NUD");
-            foreach (var n in Net.Snapshot().Nics.Where(n => n.Up && n.Index4 >= 0))
-                True(Nud.Get(AddressFamily.InterNetwork, n.Index4) != null, "NUD readable on " + n.Name);
-
             foreach (var fam in Net.Families)
             {
                 int len = fam == AddressFamily.InterNetwork ? 4 : 16;
