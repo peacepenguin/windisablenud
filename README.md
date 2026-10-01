@@ -27,7 +27,7 @@ setting it to `disabled` always fails with "The parameter is incorrect".
 The service acts on every connected adapter that has **no default gateway**, checked separately for
 IPv4 and IPv6, in three layers:
 
-0. **Block the leak (Windows Filtering Platform).** For each protected subnet the service installs a WFP
+0. **Block the leak (Windows Filtering Platform; `wfpblock=yes`, off by default).** For each protected subnet the service installs a WFP
    filter at the outbound IP-packet layer that drops any packet to that subnet leaving through *any other*
    adapter (loopback excepted). Unlike firewall rules this sees every packet, after routing, so whatever
    NUD does to the routing table, nothing for the lab subnet can reach the default gateway. The filters
@@ -37,19 +37,22 @@ IPv4 and IPv6, in three layers:
    has an address in the same range, traffic may legitimately use either, so that subnet is not blocked
    (a warning is logged). The service depends on the Base Filtering Engine (`BFE`).
 
-   The two layers below keep the connection *working* (device re-resolved on the right adapter); this
-   one guarantees it can't *leak*.
+   The layers below keep the connection *working* (device re-resolved on the right adapter); this
+   one guarantees it can't *leak*, whatever Windows decides.
 
-1. **Clear failing neighbors.** Once the WFP filter is in place a failing neighbor can no longer leak, but
-   Windows still routes its traffic to the (blocked) default gateway while its entry is Unreachable, so
-   pings and connections fail with "General failure" until the entry is gone. Once a second the service
-   reads the neighbor table and, for neighbors in the protected subnets:
-   - deletes entries marked **Unreachable** and flushes the path cache, so the next packet makes Windows
-     look the device up again on the local adapter;
-   - deletes entries that stay **Incomplete** for 2 s (without flushing the path cache, which is global) (Windows normally gives up after about 3 s, but an
-     entry sometimes stays Incomplete without sending anything, so a device that comes back is never
-     found - seen in traces);
-   - deletes entries that stay in **Probe** for more than 12 s (normally 4-8 s).
+1. **Clear failing neighbors.** Windows marks a neighbor Unreachable after about 3 s of failed lookups and
+   then routes its traffic to the default gateway. Once a second the service reads the neighbor table and,
+   for neighbors in the protected subnets:
+   - deletes entries that stay **Incomplete** for 2 s (`deleteincomplete`, on by default). Windows normally
+     gives up after about 3 s, so the neighbor never reaches Unreachable and nothing is re-routed; the
+     deleted entry is re-created by the next packet and the lookup restarts. An entry also sometimes stays
+     Incomplete without sending anything, so a device that comes back is never found (seen in traces); this
+     fixes that too;
+   - deletes entries that stay in **Probe** for more than 12 s (normally 4-8 s; same setting);
+   - deletes entries marked **Unreachable** (`deleteunreachable`, off by default) and flushes the global
+     path cache (`pathflush`, off by default). Not generally helpful on current builds of Windows, because
+     the first bullet keeps the neighbor from getting there. One Unreachable per outage can still slip
+     through, when the Probe phase ends in Unreachable before there is an Incomplete entry to delete.
 
    A device that returns is found again on the next lookup, typically within a second of its link coming up.
    The log says once per outage when a device stops answering, and when it is back.
@@ -76,18 +79,28 @@ Costs on the protected adapters:
 ## Settings
 
 `C:\ProgramData\LocalSubnetGuard\LocalSubnetGuard.conf` is created on first start and re-read every few
-seconds, so changes need no restart. Only SYSTEM and Administrators can write to it.
+seconds, so changes need no restart. Only SYSTEM and Administrators can write to it. Each setting is one
+action and works on its own.
 
 ```
-wfpblock=yes       # the WFP filters that stop packets leaving through the wrong adapter
-deleteflush=yes    # deleting failing neighbor entries (and flushing the path cache for Unreachable ones)
+wfpblock=no           # WFP filters: drop packets for a protected subnet leaving through another adapter
+deleteincomplete=yes  # delete entries stuck in Incomplete (2 s) or Probe (12 s) so the lookup restarts
+deleteunreachable=no  # delete entries Windows has marked Unreachable so the lookup restarts
+pathflush=no          # flush the path cache when a neighbor is seen Unreachable (global: every adapter)
 ```
 
-The two approaches work on their own. `wfpblock=yes, deleteflush=no` only guarantees nothing leaks (pings to
-a failed device show "General failure" until Windows retries the device itself). `wfpblock=no,
-deleteflush=yes` keeps Windows from failing over in the first place, but a packet can still leave through
-the gateway in the moments before an entry is cleared. `status` shows the current values and the log says
-when they change.
+Those are the defaults. Deleting the Incomplete entries early keeps a neighbor from ever reaching
+Unreachable, so nothing is re-routed to the default gateway and no packet leaves. That makes
+`deleteunreachable` and `pathflush` not generally helpful on current builds of Windows. `wfpblock=yes` is
+the safety net underneath: it drops a packet that would leave through the wrong adapter, whatever Windows
+decides. It can run alone (pings to a failed device then show "General failure" until Windows retries the
+device itself) or together with the delete settings.
+
+The old `deleteflush` name still works: it sets the last three, and a file that still uses it is converted
+to the new format once at start (your values are kept; the old file is saved as
+`LocalSubnetGuard.conf.old`).
+
+`status` shows the current values and the log says when they change.
 
 ## Usage
 

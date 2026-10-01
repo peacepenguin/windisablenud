@@ -282,7 +282,7 @@ Log: " + Log.PathName);
         {
             Log.Write(string.Format("Starting (interval {0} ms).", _intervalMs));
             DataDir.Secure();
-            Config.CreateIfMissing();
+            Config.EnsureFile();
             Legacy.Cleanup();
             NetworkChange.NetworkAddressChanged += OnNetChange;
             NetworkChange.NetworkAvailabilityChanged += OnNetAvailability;
@@ -355,7 +355,7 @@ Log: " + Log.PathName);
             {
                 _cfgSig = cfg.ToString();
                 Log.Write(string.Format("Settings ({0}): {1}.", Config.PathName, cfg));
-                if (!cfg.WfpBlock && !cfg.DeleteFlush) Log.Write("WARNING: wfpblock and deleteflush are both off: nothing is being done.");
+                if (!cfg.WfpBlock && !cfg.AnyHoldAction) Log.Write("WARNING: every setting is off: nothing is being done.");
             }
             _cfg = cfg;
         }
@@ -513,7 +513,7 @@ Log: " + Log.PathName);
             {
                 var held = all.Where(h => h.Prefix.Family == fam).ToList();
                 var tracker = fam == AddressFamily.InterNetwork ? _hold4 : _hold6;
-                if (!_cfg.DeleteFlush)
+                if (!_cfg.AnyHoldAction)
                 {
                     tracker.Reset();
                     if (Trace && held.Count > 0) TraceStates(Neighbors.Read(fam).Where(r => Planner.Match(held, r) != null), fam);
@@ -523,8 +523,9 @@ Log: " + Log.PathName);
                 bool flush = false;
                 var rows = Neighbors.Scan(fam, table =>
                 {
-                    var d = tracker.Decide(table, r => Planner.Match(held, r), DateTime.UtcNow, Log.Write);
-                    flush = d.Flush;
+                    var cfg = _cfg;
+                    var d = tracker.Decide(table, r => Planner.Match(held, r), DateTime.UtcNow, Log.Write, cfg.DeleteIncomplete, cfg.DeleteUnreachable);
+                    flush = d.Flush && cfg.PathFlush;
                     return d.Delete;
                 }, (r, rc) =>
                 {
@@ -565,10 +566,11 @@ Log: " + Log.PathName);
     // Keeps failing neighbors of the protected subnets from sticking. The WFP filters already stop anything
     // leaving through the wrong adapter, so this only has to get the entry out of the way quickly:
     //  - Unreachable: Windows now routes the neighbor's traffic to the (blocked) default gateway; the entry is
-    //    deleted and the path cache flushed, so the next packet makes Windows resolve it on the local adapter.
-    //    This is the only case that flushes: the flush is global (every adapter's cached paths), so it is not
-    //    done for the early deletes below, which keep the neighbor from ever getting here.
-    //  - Incomplete for StuckAfterIncomplete: Windows normally gives up after ~3 s, but an entry sometimes stays
+    //    deleted (deleteunreachable) and the path cache flushed (pathflush), so the next packet makes Windows
+    //    resolve it on the local adapter. This is the only case that flushes: the flush is global (every
+    //    adapter's cached paths), so it is not done for the early deletes below, which keep the neighbor from
+    //    ever getting here.
+    //  - Incomplete for StuckAfterIncomplete (deleteincomplete): Windows normally gives up after ~3 s, but an entry sometimes stays
     //    Incomplete without sending anything (seen in traces), so a returning device is never found. It is
     //    deleted early; Windows then restarts the lookup.
     //  - Probe for StuckAfterProbe: same, for a probe that never ends (they normally last 4-8 s).
@@ -587,7 +589,8 @@ Log: " + Log.PathName);
 
         public void Reset() { _episodes.Clear(); }
 
-        public Decision Decide(IList<NeighborRow> rows, Func<NeighborRow, HeldSubnet> protecting, DateTime now, Action<string> log)
+        public Decision Decide(IList<NeighborRow> rows, Func<NeighborRow, HeldSubnet> protecting, DateTime now, Action<string> log,
+            bool deleteIncomplete = true, bool deleteUnreachable = true)
         {
             var d = new Decision();
             for (int i = 0; i < rows.Count; i++)
@@ -600,7 +603,7 @@ Log: " + Log.PathName);
                     var e = Touch(r, h, now, log, "{0} is not answering on '{1}' ({2}) - watching it");
                     if (e.State != r.State) { e.State = r.State; e.StateSince = now; }
                     var limit = r.State == NeighborState.Incomplete ? StuckAfterIncomplete : StuckAfterProbe;
-                    if (now - e.StateSince >= limit)
+                    if (deleteIncomplete && now - e.StateSince >= limit)
                     {
                         d.Delete.Add(i); // no path-cache flush: nothing was routed away from the adapter yet
                         if (e.Holds++ == 0)
@@ -611,12 +614,14 @@ Log: " + Log.PathName);
                 }
                 else if (r.State == NeighborState.Unreachable)
                 {
-                    d.Delete.Add(i);
-                    d.Flush = true;
+                    d.Flush = true; // the caller flushes only if pathflush is on
+                    if (deleteUnreachable) d.Delete.Add(i);
                     var e = Touch(r, h, now, log, null);
                     if (e.State != r.State) { e.State = r.State; e.StateSince = now; }
                     if (e.Holds++ == 0)
-                        log(string.Format("{0} was marked Unreachable on '{1}' - clearing its entry so it is looked up again (repeats are not logged)", r.Address, h.NicName));
+                        log(string.Format(deleteUnreachable
+                            ? "{0} was marked Unreachable on '{1}' - clearing its entry so it is looked up again (repeats are not logged)"
+                            : "{0} was marked Unreachable on '{1}' (repeats are not logged)", r.Address, h.NicName));
                 }
                 else if (r.State == NeighborState.Reachable || r.State == NeighborState.Stale || r.State == NeighborState.Permanent)
                 {
@@ -1312,31 +1317,48 @@ Log: " + Log.PathName);
 
     // ------------------------------------------------------------------ settings file
     // %ProgramData%\LocalSubnetGuard\LocalSubnetGuard.conf (writable by SYSTEM and Administrators only), re-read
-    // every few seconds, so changes need no restart:
-    //   wfpblock=yes|no     the WFP filters that drop packets for a protected subnet leaving through another adapter
-    //   deleteflush=yes|no  deleting failing neighbor entries (and flushing the path cache for Unreachable ones)
-    // Each works on its own; both default to yes.
+    // every few seconds, so changes need no restart. Each setting is one action and works on its own:
+    //   wfpblock=yes|no          WFP filters that drop packets for a protected subnet leaving through another adapter (default no)
+    //   deleteincomplete=yes|no  delete neighbor entries stuck in Incomplete (2 s) or Probe (12 s), so the lookup restarts (default yes)
+    //   deleteunreachable=yes|no delete neighbor entries Windows has marked Unreachable (default no)
+    //   pathflush=yes|no         flush the (global) path cache when a neighbor is seen Unreachable (default no)
+    // Deleting the Incomplete entries early keeps the neighbor from reaching Unreachable (so nothing leaks), which
+    // makes deleteunreachable and pathflush unnecessary on current builds of Windows.
+    // The old name deleteflush=yes|no sets the last three.
     sealed class Config
     {
-        public bool WfpBlock = true, DeleteFlush = true;
+        public bool WfpBlock = false, DeleteIncomplete = true, DeleteUnreachable = false, PathFlush = false;
 
         public static string PathName { get { return Path.Combine(DataDir.Location, "LocalSubnetGuard.conf"); } }
 
+        static string YesNo(bool b) { return b ? "yes" : "no"; }
+
         public override string ToString()
         {
-            return string.Format("wfpblock={0}, deleteflush={1}", WfpBlock ? "yes" : "no", DeleteFlush ? "yes" : "no");
+            return string.Format("wfpblock={0}, deleteincomplete={1}, deleteunreachable={2}, pathflush={3}",
+                YesNo(WfpBlock), YesNo(DeleteIncomplete), YesNo(DeleteUnreachable), YesNo(PathFlush));
         }
+
+        public bool AnyHoldAction { get { return DeleteIncomplete || DeleteUnreachable || PathFlush; } }
 
         const string Template =
 @"# LocalSubnetGuard settings. Changes are picked up within a few seconds; no restart needed.
-# Each setting works on its own. Values: yes / no.
+# Each setting is one action and works on its own. Values: yes / no.
 
 # Drop packets for a protected subnet that would leave through any other adapter (Windows Filtering Platform).
-wfpblock=yes
+wfpblock={wfpblock}
 
-# Delete failing neighbor entries (Unreachable, or stuck in Incomplete / Probe) so Windows looks the device
-# up again on the local adapter; the path cache is flushed for Unreachable ones.
-deleteflush=yes
+# Delete neighbor entries that are stuck in Incomplete (2 s) or Probe (12 s), so Windows looks the device up again.
+# This keeps the neighbor from ever reaching Unreachable, so nothing is re-routed to the default gateway.
+deleteincomplete={deleteincomplete}
+
+# Delete neighbor entries Windows has marked Unreachable, so Windows looks the device up again.
+# Not generally helpful on current builds of Windows: deleteincomplete already prevents Unreachable.
+deleteunreachable={deleteunreachable}
+
+# Flush the path cache when a neighbor is seen Unreachable. The flush is global: it resets cached paths on every adapter.
+# Not generally helpful on current builds of Windows.
+pathflush={pathflush}
 ";
 
         public static Config Parse(IEnumerable<string> lines, List<string> warnings)
@@ -1354,10 +1376,21 @@ deleteflush=yes
                 int eq = line.IndexOf('=');
                 if (eq < 0) { warnings.Add(string.Format("settings line {0}: expected key=value, got '{1}'", n, line)); continue; }
                 string key = line.Substring(0, eq).Trim().ToLowerInvariant(), val = line.Substring(eq + 1).Trim().ToLowerInvariant();
+                if (key != "wfpblock" && key != "deleteincomplete" && key != "deleteunreachable" && key != "pathflush" && key != "deleteflush")
+                { warnings.Add(string.Format("settings line {0}: unknown setting '{1}'", n, key)); continue; }
                 bool b;
-                if (key != "wfpblock" && key != "deleteflush") { warnings.Add(string.Format("settings line {0}: unknown setting '{1}'", n, key)); continue; }
                 if (!TryBool(val, out b)) { warnings.Add(string.Format("settings line {0}: '{1}' must be yes or no, not '{2}'; using the default", n, key, val)); continue; }
-                if (key == "wfpblock") c.WfpBlock = b; else c.DeleteFlush = b;
+                switch (key)
+                {
+                    case "wfpblock": c.WfpBlock = b; break;
+                    case "deleteincomplete": c.DeleteIncomplete = b; break;
+                    case "deleteunreachable": c.DeleteUnreachable = b; break;
+                    case "pathflush": c.PathFlush = b; break;
+                    case "deleteflush": // the old combined setting
+                        c.DeleteIncomplete = c.DeleteUnreachable = c.PathFlush = b;
+                        warnings.Add(string.Format("settings line {0}: 'deleteflush' was split into deleteincomplete, deleteunreachable and pathflush; it sets all three", n));
+                        break;
+                }
             }
             return c;
         }
@@ -1388,10 +1421,37 @@ deleteflush=yes
             }
         }
 
-        public static void CreateIfMissing()
+        // The template with this configuration's values filled in.
+        public string Render()
         {
-            try { if (!File.Exists(PathName)) File.WriteAllText(PathName, Template.Replace("\r\n", "\n").Replace("\n", Environment.NewLine)); }
-            catch (Exception ex) { Log.Write("WARNING: could not create " + PathName + ": " + ex.Message); }
+            return Template.Replace("\r\n", "\n").Replace("\n", Environment.NewLine)
+                .Replace("{wfpblock}", YesNo(WfpBlock))
+                .Replace("{deleteincomplete}", YesNo(DeleteIncomplete))
+                .Replace("{deleteunreachable}", YesNo(DeleteUnreachable))
+                .Replace("{pathflush}", YesNo(PathFlush));
+        }
+
+        // True if the file uses the old combined deleteflush setting.
+        public static bool IsOldFormat(IEnumerable<string> lines)
+        {
+            return lines.Any(l => l.Split('#')[0].Trim().ToLowerInvariant().StartsWith("deleteflush"));
+        }
+
+        // Writes the commented template if there is no settings file. A file in the old format is converted once
+        // (same values, the old file kept as .old); any other existing file is left alone.
+        public static void EnsureFile()
+        {
+            try
+            {
+                if (!File.Exists(PathName)) { File.WriteAllText(PathName, new Config().Render()); return; }
+                var lines = File.ReadAllLines(PathName);
+                if (!IsOldFormat(lines)) return;
+                var c = Parse(lines, new List<string>());
+                File.Copy(PathName, PathName + ".old", true);
+                File.WriteAllText(PathName, c.Render());
+                Log.Write(string.Format("Converted the old settings file to the new format ({0}); the previous one is kept as {1}.old", c, PathName));
+            }
+            catch (Exception ex) { Log.Write("WARNING: could not create or update " + PathName + ": " + ex.Message); }
         }
     }
 

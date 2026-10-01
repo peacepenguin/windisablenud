@@ -159,25 +159,70 @@ namespace LocalSubnetGuard.Tests
         {
             List<string> w;
             var c = Cfg(out w);
-            True(c.WfpBlock && c.DeleteFlush && w.Count == 0, "an empty file means both on");
-            c = Cfg(out w, "# comment", "", "wfpblock=no", "  DeleteFlush = YES   # trailing comment");
-            True(!c.WfpBlock && c.DeleteFlush && w.Count == 0, "keys and values are case-insensitive, comments ignored");
-            c = Cfg(out w, "wfpblock=off", "deleteflush=0");
-            True(!c.WfpBlock && !c.DeleteFlush && w.Count == 0, "off and 0 mean no");
-            c = Cfg(out w, "wfpblock=true", "deleteflush=on");
-            True(c.WfpBlock && c.DeleteFlush && w.Count == 0, "true and on mean yes");
-            Eq("wfpblock=no, deleteflush=yes", Cfg(out w, "wfpblock=no").ToString(), "formatting");
+            True(!c.WfpBlock && c.DeleteIncomplete && !c.DeleteUnreachable && !c.PathFlush && w.Count == 0, "an empty file means only deleteincomplete");
+            c = Cfg(out w, "# comment", "", "wfpblock=yes", "  PathFlush = YES   # trailing comment");
+            True(c.WfpBlock && c.PathFlush && c.DeleteIncomplete && !c.DeleteUnreachable && w.Count == 0, "keys and values are case-insensitive, comments ignored");
+            c = Cfg(out w, "wfpblock=off", "deleteincomplete=0", "deleteunreachable=no", "pathflush=false");
+            True(!c.WfpBlock && !c.DeleteIncomplete && !c.DeleteUnreachable && !c.PathFlush && !c.AnyHoldAction && w.Count == 0, "off, 0, no and false mean no");
+            c = Cfg(out w, "wfpblock=true", "deleteincomplete=on");
+            True(c.WfpBlock && c.DeleteIncomplete && w.Count == 0, "true and on mean yes");
+            Eq("wfpblock=yes, deleteincomplete=yes, deleteunreachable=no, pathflush=no", Cfg(out w, "wfpblock=yes").ToString(), "formatting");
+        }
+
+        static void TestConfigRenderAndOldFormat()
+        {
+            List<string> w;
+            var c = Cfg(out w, "wfpblock=no", "deleteincomplete=yes", "deleteunreachable=no", "pathflush=no");
+            var again = Config.Parse(c.Render().Split('\n'), new List<string>());
+            Eq(c.ToString(), again.ToString(), "a rendered file reads back the same");
+            Eq("wfpblock=no, deleteincomplete=yes, deleteunreachable=no, pathflush=no", Config.Parse(new Config().Render().Split('\n'), new List<string>()).ToString(), "the template holds the defaults");
+            True(Config.IsOldFormat(new[] { "wfpblock=no", "deleteflush=yes" }), "old format detected");
+            True(!Config.IsOldFormat(new[] { "# deleteflush=yes (old name)", "wfpblock=no" }), "a comment is not the old format");
+            True(!Config.IsOldFormat(new[] { "deleteincomplete=yes" }), "new format");
+        }
+
+        static void TestConfigOldDeleteFlushSetsTheThree()
+        {
+            List<string> w;
+            var c = Cfg(out w, "deleteflush=no");
+            c = Cfg(out w, "wfpblock=yes", "deleteflush=no");
+            True(c.WfpBlock && !c.DeleteIncomplete && !c.DeleteUnreachable && !c.PathFlush, "deleteflush=no turns the three off");
+            True(w.Count == 1 && w[0].Contains("deleteflush"), "and says it was renamed");
+            c = Cfg(out w, "deleteflush=yes");
+            True(c.DeleteIncomplete && c.DeleteUnreachable && c.PathFlush, "deleteflush=yes turns the three on");
         }
 
         static void TestConfigProblemsWarnAndKeepDefaults()
         {
             List<string> w;
             var c = Cfg(out w, "wfpblock=maybe", "bogus=yes", "nonsense");
-            True(c.WfpBlock && c.DeleteFlush, "bad values keep the defaults");
+            True(!c.WfpBlock && c.DeleteIncomplete && !c.DeleteUnreachable && !c.PathFlush, "bad values keep the defaults");
             Eq(3, w.Count, "one warning each");
             True(w[0].Contains("line 1") && w[0].Contains("yes or no"), w[0]);
             True(w[1].Contains("unknown setting 'bogus'"), w[1]);
             True(w[2].Contains("expected key=value"), w[2]);
+        }
+
+        static void TestSettingsSwitchTheHoldActionsIndependently()
+        {
+            var match = LabMatch("192.168.50.0/24");
+            var t0 = new DateTime(2026, 1, 1);
+            Func<bool, bool, HoldTracker.Decision> unreachable = (delInc, delUnr) =>
+                new HoldTracker().Decide(new[] { Row("192.168.50.9", 2, NeighborState.Unreachable) }, match, t0, s => { }, delInc, delUnr);
+            var d = unreachable(true, true);
+            True(d.Delete.Count == 1 && d.Flush, "Unreachable: deleted, flush requested");
+            d = unreachable(true, false);
+            True(d.Delete.Count == 0 && d.Flush, "deleteunreachable=no: not deleted, flush still requested for pathflush");
+            d = unreachable(false, true);
+            True(d.Delete.Count == 1, "deleteincomplete=no does not stop Unreachable deletes");
+
+            var t = new HoldTracker();
+            var log = new List<string>();
+            t.Decide(new[] { Row("192.168.50.9", 2, NeighborState.Incomplete) }, match, t0, log.Add, false, true);
+            d = t.Decide(new[] { Row("192.168.50.9", 2, NeighborState.Incomplete) }, match, t0.AddSeconds(5), log.Add, false, true);
+            True(d.Delete.Count == 0, "deleteincomplete=no: a stuck Incomplete is left alone");
+            d = t.Decide(new[] { Row("192.168.50.9", 2, NeighborState.Incomplete) }, match, t0.AddSeconds(6), log.Add, true, true);
+            True(d.Delete.Count == 1 && !d.Flush, "deleteincomplete=yes: deleted, no flush");
         }
 
         // ---------------------------------------------------------------- HoldTracker
