@@ -11,12 +11,12 @@
 //               active store only, so a reboot resets them), so a neighbor that goes quiet for less than
 //               about 30 s is never marked Unreachable. The original values are put back when the
 //               service stops or the adapter gains a default gateway.
-//  2. Reset     a neighbor in one of the adapter's subnets that has not answered for half of NUD's
-//               budget (1.5 x RetransmitTime, in state Incomplete or Probe) has its entry deleted, so
-//               Windows starts over and never marks it Unreachable; its packets keep waiting on the
-//               local adapter instead of being re-routed.
-//  3. Hold      a neighbor that is marked Unreachable anyway has its entry deleted and the path cache
-//               flushed, so Windows re-resolves it on the local adapter instead of re-routing it.
+//  2. Hold      a neighbor in one of the adapter's subnets that is marked Unreachable anyway has its
+//               entry deleted and the path cache flushed, so Windows re-resolves it on the local adapter
+//               instead of re-routing it. While a neighbor is failing (Probe or Incomplete) the neighbor
+//               table is polled every 10 ms instead of every interval, so this happens within ~10-16 ms.
+//               Unreachable itself cannot be prevented: deleting an entry that is in Probe or Incomplete
+//               makes Windows mark it Unreachable at once.
 //
 // Everything follows the live network configuration; nothing is blocked or remembered.
 //
@@ -25,7 +25,9 @@
 // Usage (elevated, except status):
 //   LocalSubnetGuard.exe install [intervalMs]   install + start as a Windows service (default 250 ms)
 //   LocalSubnetGuard.exe uninstall              stop + remove the service (restores the NUD timers)
-//   LocalSubnetGuard.exe run [intervalMs]       run in this console (Ctrl+C to stop and restore the timers)
+//   LocalSubnetGuard.exe run [intervalMs] [trace]
+//                                               run in this console (Ctrl+C to stop and restore the timers);
+//                                               'trace' also logs every state change of protected neighbors
 //   LocalSubnetGuard.exe status                 show adapters, protected subnets, NUD timers and neighbors
 
 using System;
@@ -63,12 +65,19 @@ namespace LocalSubnetGuard
                     return Status();
                 case "install":
                 case "run":
-                    if (!ParseInterval(args, out interval)) { Console.Error.WriteLine("intervalMs must be 50-60000."); return 1; }
+                {
+                    bool trace = cmd == "run" && args.Skip(1).Any(a => a.Equals("trace", StringComparison.OrdinalIgnoreCase));
+                    var rest = args.Where(a => !a.Equals("trace", StringComparison.OrdinalIgnoreCase)).ToArray();
+                    if (!ParseInterval(rest, out interval)) { Console.Error.WriteLine("intervalMs must be 50-60000."); return 1; }
                     if (!IsAdmin()) return NotAdmin();
-                    return cmd == "install" ? Setup.Install(interval) : RunConsole(interval);
+                    return cmd == "install" ? Setup.Install(interval) : RunConsole(interval, trace);
+                }
                 case "uninstall":
                     if (!IsAdmin()) return NotAdmin();
                     return Setup.Uninstall();
+                case "wfptest":
+                    if (!IsAdmin()) return NotAdmin();
+                    return WfpTest(args);
                 case "help": case "h": case "?":
                     Help(); return 0;
                 default:
@@ -102,13 +111,18 @@ namespace LocalSubnetGuard
 
   LocalSubnetGuard.exe install [intervalMs]   install + start the service (default 250 ms)
   LocalSubnetGuard.exe uninstall              stop + remove the service (restores the NUD timers)
-  LocalSubnetGuard.exe run [intervalMs]       run in this console (Ctrl+C to stop and restore the timers)
+  LocalSubnetGuard.exe run [intervalMs] [trace]
+                                              run in this console (Ctrl+C to stop and restore the timers);
+                                              'trace' also logs every state change of protected neighbors
   LocalSubnetGuard.exe status                 show adapters, protected subnets, NUD timers and neighbors
+  LocalSubnetGuard.exe wfptest <cidr> on|except <adapter>
+                                              diagnostic: block outbound packets to <cidr> leaving through
+                                              <adapter> (on) or any other adapter (except), until Enter
 
 Log: " + Log.PathName);
         }
 
-        static int RunConsole(int intervalMs)
+        static int RunConsole(int intervalMs, bool trace)
         {
             if (Setup.ServiceRunning())
             {
@@ -116,7 +130,7 @@ Log: " + Log.PathName);
                 return 1;
             }
             Log.Echo = true;
-            var g = new Guard(intervalMs);
+            var g = new Guard(intervalMs) { Trace = trace };
             var done = new ManualResetEvent(false);
             Console.CancelKeyPress += (s, e) => { e.Cancel = true; done.Set(); };
             g.Start();
@@ -124,6 +138,46 @@ Log: " + Log.PathName);
             done.WaitOne();
             g.Stop(true);
             return 0;
+        }
+
+        // Diagnostic: adds one WFP block filter until Enter is pressed (or the process ends in any way).
+        static int WfpTest(string[] args)
+        {
+            Prefix p;
+            if (args.Length != 4 || !Prefix.TryParse(args[1], out p) || (args[2] != "on" && args[2] != "except"))
+            {
+                Console.Error.WriteLine("Usage: LocalSubnetGuard.exe wfptest <cidr> on|except <adapter name>");
+                return 1;
+            }
+            bool except = args[2] == "except";
+            var nics = Net.Snapshot().Nics;
+            var nic = nics.FirstOrDefault(n => n.Name.Equals(args[3], StringComparison.OrdinalIgnoreCase));
+            if (nic == null || nic.Index(p.Family) < 0)
+            {
+                Console.Error.WriteLine("No adapter '{0}' with {1}. Adapters: {2}", args[3], Net.FamilyName(p.Family),
+                    string.Join(", ", nics.Select(n => "'" + n.Name + "'")));
+                return 1;
+            }
+            try
+            {
+                using (var wfp = Wfp.Open())
+                {
+                    Console.WriteLine("Layer OK: {0}", wfp.CheckLayer(p.Family));
+                    string what = except ? string.Format("to {0} leaving through any adapter except '{1}' (loopback allowed)", p, nic.Name)
+                                         : string.Format("to {0} leaving through '{1}'", p, nic.Name);
+                    ulong id = wfp.AddBlock(p, Wfp.LuidOf(nic.Index(p.Family)), except, "LocalSubnetGuard wfptest");
+                    Console.WriteLine("Blocking outbound packets {0} (filter id {1}).", what, id);
+                    Console.WriteLine("Press Enter to remove it. Ctrl+C or closing the window removes it too.");
+                    Console.ReadLine();
+                }
+                Console.WriteLine("Filter removed.");
+                return 0;
+            }
+            catch (InvalidOperationException ex)
+            {
+                Console.Error.WriteLine("WFP: " + ex.Message);
+                return 1;
+            }
         }
 
         static int Status()
@@ -139,7 +193,7 @@ Log: " + Log.PathName);
                     n.Prefixes.Count == 0 ? "-" : string.Join(", ", n.Prefixes));
             }
 
-            Console.WriteLine("Protected subnets (neighbors are kept from being marked Unreachable):");
+            Console.WriteLine("Protected subnets (neighbors marked Unreachable are held on the adapter):");
             if (held.Count == 0) Console.WriteLine("  (none: every connected adapter has a default gateway)");
             foreach (var h in held)
             {
@@ -184,12 +238,17 @@ Log: " + Log.PathName);
     {
         class Tuned { public string NicId, NicName; public AddressFamily Family; public int OrigBase, OrigRetransmit; }
 
+        const int FastIntervalMs = 10; // poll interval while a protected neighbor is failing
+
         readonly int _intervalMs;
         readonly HoldTracker _hold4 = new HoldTracker(), _hold6 = new HoldTracker();
         readonly Dictionary<string, Tuned> _tuned = new Dictionary<string, Tuned>(); // adapter id|family -> original timers
         readonly HashSet<string> _tuneFailures = new HashSet<string>();
+        readonly Dictionary<string, NeighborState> _traced = new Dictionary<string, NeighborState>(); // trace: last state seen
         List<HeldSubnet> _held = new List<HeldSubnet>();
         string _lastSig;
+
+        public bool Trace; // log every state change of protected neighbors, and every entry deleted
         volatile bool _refresh = true;
         DateTime _nextRefresh = DateTime.MinValue;
         Thread _thread;
@@ -235,6 +294,7 @@ Log: " + Log.PathName);
         {
             while (!_stop.WaitOne(0))
             {
+                bool urgent = false;
                 try
                 {
                     if (_refresh || DateTime.UtcNow >= _nextRefresh)
@@ -243,10 +303,10 @@ Log: " + Log.PathName);
                         _nextRefresh = DateTime.UtcNow.AddSeconds(5);
                         Refresh();
                     }
-                    Tick();
+                    urgent = Tick();
                 }
                 catch (Exception ex) { Log.Write("ERROR: " + ex.Message); }
-                _stop.WaitOne(_intervalMs);
+                _stop.WaitOne(urgent ? Math.Min(FastIntervalMs, _intervalMs) : _intervalMs);
             }
         }
 
@@ -255,12 +315,12 @@ Log: " + Log.PathName);
             var snap = Net.Snapshot();
             var held = Planner.Build(snap);
             ApplyTimers(snap, held);
-            foreach (var h in held)
+            string sig = string.Join(", ", held.Select(h =>
             {
                 int b, r;
-                if (NudTimers.Get(h.Prefix.Family, h.IfIndex, out b, out r)) h.SetResetAfter(r);
-            }
-            string sig = string.Join(", ", held.Select(h => h.Prefix + " on '" + h.NicName + "'"));
+                return string.Format("{0} on '{1}' (NUD timers {2})", h.Prefix, h.NicName,
+                    NudTimers.Get(h.Prefix.Family, h.IfIndex, out b, out r) ? string.Format("{0} / {1} ms", b, r) : "unknown");
+            }));
             if (sig != _lastSig)
             {
                 _lastSig = sig;
@@ -319,67 +379,98 @@ Log: " + Log.PathName);
                 : string.Format("ERROR: could not restore NUD timers on '{0}' ({1}): {2}", t.NicName, Net.FamilyName(t.Family), err));
         }
 
-        void Tick()
+        // Returns true while a protected neighbor is failing (Probe, Incomplete or Unreachable), so the loop
+        // polls fast and catches it being marked Unreachable within FastIntervalMs.
+        bool Tick()
         {
             var all = _held;
+            bool urgent = false;
             foreach (var fam in Net.Families)
             {
                 var held = all.Where(h => h.Prefix.Family == fam).ToList();
                 var tracker = fam == AddressFamily.InterNetwork ? _hold4 : _hold6;
                 if (held.Count == 0 && tracker.Count == 0) continue;
                 bool flush = false;
-                Neighbors.Scan(fam, rows =>
+                var rows = Neighbors.Scan(fam, table =>
                 {
-                    var d = tracker.Decide(rows, r => Planner.Match(held, r), DateTime.UtcNow, Log.Write);
+                    var d = tracker.Decide(table, r => Planner.Match(held, r), DateTime.UtcNow, Log.Write);
                     flush = d.Flush;
+                    if (d.Urgent) urgent = true;
                     return d.Delete;
+                }, (r, rc) =>
+                {
+                    if (rc != 0) Log.Write(string.Format("ERROR: could not delete the neighbor entry for {0} ({1}): error {2}", r.Address, r.State, rc));
+                    else if (Trace) Log.Write(string.Format("trace: deleted {0} [{1}] ({2})", r.Address, r.IfIndex, r.State));
                 });
-                if (flush) Neighbors.FlushPathCache(fam);
+                if (flush)
+                {
+                    int rc = Neighbors.FlushPathCache(fam);
+                    if (Trace || rc != 0) Log.Write(string.Format("{0}flushed the {1} path cache (result {2})", rc == 0 ? "trace: " : "ERROR: ", Net.FamilyName(fam), rc));
+                }
+                if (Trace) TraceStates(rows.Where(r => Planner.Match(held, r) != null), fam);
+            }
+            return urgent;
+        }
+
+        // Logs each state change of a protected neighbor (as read at the start of this pass).
+        void TraceStates(IEnumerable<NeighborRow> rows, AddressFamily fam)
+        {
+            var seen = new HashSet<string>();
+            foreach (var r in rows)
+            {
+                seen.Add(r.Key);
+                NeighborState last;
+                bool known = _traced.TryGetValue(r.Key, out last);
+                if (!known || last != r.State)
+                    Log.Write(string.Format("trace: {0} [{1}] {2} -> {3}", r.Address, r.IfIndex, known ? last.ToString() : "(new)", r.State));
+                _traced[r.Key] = r.State;
+            }
+            bool v6 = fam == AddressFamily.InterNetworkV6; // only IPv6 keys contain ':'
+            foreach (var key in _traced.Keys.Where(k => !seen.Contains(k) && k.Contains(':') == v6).ToList())
+            {
+                Log.Write(string.Format("trace: {0} {1} -> (gone)", key, _traced[key]));
+                _traced.Remove(key);
             }
         }
     }
 
-    // Keeps NUD from ever giving up on a neighbor in a protected subnet. Windows marks a neighbor
-    // Unreachable after about 3 x RetransmitTime of unanswered solicitations (state Incomplete) or probes
-    // (state Probe); until then its packets wait on the local adapter. So a neighbor that has been in one
-    // of those states for the subnet's ResetAfter (1.5 x RetransmitTime) has its entry deleted: Windows
-    // starts over with a fresh countdown and never reaches Unreachable. A neighbor that is marked
-    // Unreachable anyway is deleted too, and the caller flushes the path cache (it may already point at
-    // the gateway). An episode ends when the neighbor answers, or after Expiry with nothing to do (no
-    // more traffic to it).
+    // Catches NUD giving up on a neighbor in a protected subnet. Windows marks a neighbor Unreachable after
+    // about 3 x RetransmitTime of unanswered probes (state Probe) or solicitations (state Incomplete), and
+    // from then on routes its traffic to the default gateway. That cannot be prevented: deleting an entry in
+    // Probe or Incomplete makes Windows mark it Unreachable at once (seen in traces). So while a protected
+    // neighbor is in one of those states the caller polls fast (Decision.Urgent), and the moment one is
+    // marked Unreachable its entry is deleted and the caller flushes the path cache, so Windows re-resolves
+    // it on the local adapter. An episode ends when the neighbor answers, or after Expiry without it being
+    // seen in Probe, Incomplete or Unreachable (no more traffic to it).
     class HoldTracker
     {
-        class Episode { public string Nic; public DateTime Since, LastAction; public int Resets, Holds; }
+        class Episode { public string Nic; public DateTime Since, LastSeen; public int Holds; }
 
-        public class Decision { public List<int> Delete = new List<int>(); public bool Flush; }
+        public class Decision { public List<int> Delete = new List<int>(); public bool Flush, Urgent; }
 
         public static readonly TimeSpan Expiry = TimeSpan.FromSeconds(60);
-        readonly Dictionary<string, DateTime> _waiting = new Dictionary<string, DateTime>(); // key -> first seen Incomplete/Probe
         readonly Dictionary<string, Episode> _episodes = new Dictionary<string, Episode>();
 
-        public int Count { get { return _waiting.Count + _episodes.Count; } }
+        public int Count { get { return _episodes.Count; } }
 
         public Decision Decide(IList<NeighborRow> rows, Func<NeighborRow, HeldSubnet> protecting, DateTime now, Action<string> log)
         {
             var d = new Decision();
-            var stillWaiting = new HashSet<string>();
             for (int i = 0; i < rows.Count; i++)
             {
                 var r = rows[i];
                 var h = protecting(r);
                 if (h == null) continue;
-                if (r.State == NeighborState.Incomplete || r.State == NeighborState.Probe)
+                if (r.State == NeighborState.Probe || r.State == NeighborState.Incomplete)
                 {
-                    DateTime start;
-                    if (!_waiting.TryGetValue(r.Key, out start)) _waiting[r.Key] = start = now;
-                    if (now - start < h.ResetAfter) { stillWaiting.Add(r.Key); continue; }
-                    d.Delete.Add(i);
-                    Touch(r, h, now, log, "{0} is not answering on '{1}' - resetting its entry so it is never marked Unreachable").Resets++;
+                    d.Urgent = true;
+                    Touch(r, h, now, log, "{0} is not answering on '{1}' ({2}) - watching it closely");
                 }
                 else if (r.State == NeighborState.Unreachable)
                 {
                     d.Delete.Add(i);
                     d.Flush = true;
+                    d.Urgent = true;
                     log(string.Format("{0} was marked Unreachable on '{1}' - holding it on the local adapter", r.Address, h.NicName));
                     Touch(r, h, now, log, null).Holds++;
                 }
@@ -388,15 +479,13 @@ Log: " + Log.PathName);
                     Episode e;
                     if (_episodes.TryGetValue(r.Key, out e))
                     {
-                        log(string.Format("{0} answered on '{1}' ({2}) after {3:0.0}s (reset {4}, held {5} time(s))",
-                            r.Address, e.Nic, r.State, (now - e.Since).TotalSeconds, e.Resets, e.Holds));
+                        log(string.Format("{0} answered on '{1}' ({2}) after {3:0.0}s, held {4} time(s)",
+                            r.Address, e.Nic, r.State, (now - e.Since).TotalSeconds, e.Holds));
                         _episodes.Remove(r.Key);
                     }
                 }
             }
-            // A countdown ends when the entry leaves Incomplete/Probe, is deleted, or disappears.
-            foreach (var key in _waiting.Keys.Where(k => !stillWaiting.Contains(k)).ToList()) _waiting.Remove(key);
-            foreach (var kv in _episodes.Where(kv => now - kv.Value.LastAction > Expiry).ToList())
+            foreach (var kv in _episodes.Where(kv => now - kv.Value.LastSeen > Expiry).ToList())
             {
                 log(string.Format("{0} on '{1}' has had no traffic for {2:0}s; no longer tracking it",
                     kv.Key.Substring(0, kv.Key.IndexOf('%')), kv.Value.Nic, Expiry.TotalSeconds));
@@ -405,28 +494,22 @@ Log: " + Log.PathName);
             return d;
         }
 
-        // Starts an episode (logging firstMessage, if any) or continues it.
+        // Starts an episode (logging firstMessage, if any, formatted with address, adapter and state) or continues it.
         Episode Touch(NeighborRow r, HeldSubnet h, DateTime now, Action<string> log, string firstMessage)
         {
             Episode e;
             if (!_episodes.TryGetValue(r.Key, out e))
             {
                 _episodes[r.Key] = e = new Episode { Nic = h.NicName, Since = now };
-                if (firstMessage != null) log(string.Format(firstMessage, r.Address, h.NicName));
+                if (firstMessage != null) log(string.Format(firstMessage, r.Address, h.NicName, r.State));
             }
-            e.LastAction = now;
+            e.LastSeen = now;
             return e;
         }
     }
 
     // ------------------------------------------------------------------ planning (pure; unit tested)
-    class HeldSubnet
-    {
-        public Prefix Prefix; public int IfIndex; public string NicId, NicName;
-        public TimeSpan ResetAfter = TimeSpan.FromMilliseconds(1.5 * NudTimers.DefaultRetransmitMs); // set from the adapter's timers
-
-        public void SetResetAfter(int retransmitMs) { ResetAfter = TimeSpan.FromMilliseconds(1.5 * retransmitMs); }
-    }
+    class HeldSubnet { public Prefix Prefix; public int IfIndex; public string NicId, NicName; }
 
     static class Planner
     {
@@ -466,6 +549,7 @@ Log: " + Log.PathName);
         }
 
         public AddressFamily Family { get { return _net.Length == 4 ? AddressFamily.InterNetwork : AddressFamily.InterNetworkV6; } }
+        public byte[] NetworkBytes { get { return (byte[])_net.Clone(); } }
 
         public bool Contains(byte[] addr)
         {
@@ -622,6 +706,205 @@ Log: " + Log.PathName);
         }
     }
 
+    // ------------------------------------------------------------------ Windows Filtering Platform
+    // Outbound block filters at the OUTBOUND_IPPACKET layers: they see every packet (not just the first of a
+    // connection, like firewall rules), after routing, so the adapter a packet leaves through is known. They
+    // are added in a dynamic session, so the Base Filtering Engine removes them by itself when the engine
+    // handle is closed or this process exits for any reason - they can never outlive the program.
+    sealed class Wfp : IDisposable
+    {
+        static readonly Guid LayerOutboundIpPacketV4 = new Guid("1e5c9fae-8a84-4135-a331-950b54229ecd");
+        static readonly Guid LayerOutboundIpPacketV6 = new Guid("a3b3ab6b-3564-488c-9117-f34e82142763");
+        static readonly Guid CondIpRemoteAddress = new Guid("b235ae9a-1d64-49b8-a44c-5ff3d9095045");
+        static readonly Guid CondIpLocalInterface = new Guid("4cd62a49-59c3-4969-b7f3-bda5d32890a4");
+        static readonly Guid CondFlags = new Guid("632ce23b-5167-435c-86d7-e903684aa80c");
+        static readonly Guid SubLayerKey = new Guid("dde24a5d-af73-4e90-b7e9-a8a8b7173dbd"); // ours
+
+        const uint RpcAuthnDefault = 0xFFFFFFFF, SessionFlagDynamic = 1;
+        const uint FwpEmpty = 0, FwpUint32 = 3, FwpUint64 = 4, FwpV4AddrMask = 0x100, FwpV6AddrMask = 0x101;
+        const uint MatchEqual = 0, MatchFlagsNoneSet = 8, MatchNotEqual = 10;
+        const uint ActionBlock = 0x1001;           // FWP_ACTION_BLOCK (0x1 | FWP_ACTION_FLAG_TERMINATING)
+        const uint ConditionFlagIsLoopback = 1;    // FWP_CONDITION_FLAG_IS_LOOPBACK
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct DisplayData { public string Name; public string Description; }
+        [StructLayout(LayoutKind.Sequential)] struct ByteBlob { public uint Size; public IntPtr Data; }
+        [StructLayout(LayoutKind.Sequential)] struct Value { public uint Type; public ulong Data; } // FWP_VALUE0 / FWP_CONDITION_VALUE0
+        [StructLayout(LayoutKind.Sequential)] struct Condition { public Guid FieldKey; public uint MatchType; public Value ConditionValue; }
+        [StructLayout(LayoutKind.Sequential)] struct Action { public uint Type; public Guid FilterType; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct Session
+        {
+            public Guid SessionKey; public DisplayData DisplayData; public uint Flags; public uint TxnWaitTimeoutInMSec;
+            public uint ProcessId; public IntPtr Sid; public IntPtr Username; public int KernelMode;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct SubLayer
+        {
+            public Guid SubLayerKey; public DisplayData DisplayData; public uint Flags; public IntPtr ProviderKey;
+            public ByteBlob ProviderData; public ushort Weight;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct Filter
+        {
+            public Guid FilterKey; public DisplayData DisplayData; public uint Flags; public IntPtr ProviderKey;
+            public ByteBlob ProviderData; public Guid LayerKey; public Guid SubLayerKey; public Value Weight;
+            public uint NumFilterConditions; public IntPtr FilterCondition; public Action Action;
+            public ulong ProviderContext, ProviderContextHigh; // union { UINT64 rawContext; GUID providerContextKey; }
+            public IntPtr Reserved; public ulong FilterId; public Value EffectiveWeight;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct Layer
+        {
+            public Guid LayerKey; public IntPtr Name, Description; public uint Flags; public uint NumFields;
+            public IntPtr Field; public Guid DefaultSubLayerKey; public ushort LayerId;
+        }
+        [StructLayout(LayoutKind.Sequential)] struct Field { public IntPtr FieldKey; public uint Type; public uint DataType; }
+
+        [DllImport("fwpuclnt.dll", CharSet = CharSet.Unicode)]
+        static extern uint FwpmEngineOpen0(string serverName, uint authnService, IntPtr authIdentity, ref Session session, out IntPtr engine);
+        [DllImport("fwpuclnt.dll")] static extern uint FwpmEngineClose0(IntPtr engine);
+        [DllImport("fwpuclnt.dll")] static extern uint FwpmSubLayerAdd0(IntPtr engine, ref SubLayer subLayer, IntPtr sd);
+        [DllImport("fwpuclnt.dll")] static extern uint FwpmFilterAdd0(IntPtr engine, ref Filter filter, IntPtr sd, out ulong id);
+        [DllImport("fwpuclnt.dll")] static extern uint FwpmLayerGetByKey0(IntPtr engine, ref Guid key, out IntPtr layer);
+        [DllImport("fwpuclnt.dll")] static extern void FwpmFreeMemory0(ref IntPtr p);
+        [DllImport("iphlpapi.dll")] static extern int ConvertInterfaceIndexToLuid(uint ifIndex, out ulong luid);
+
+        IntPtr _engine;
+
+        Wfp(IntPtr engine) { _engine = engine; }
+
+        public static Wfp Open()
+        {
+            var session = new Session { DisplayData = new DisplayData { Name = "LocalSubnetGuard" }, Flags = SessionFlagDynamic };
+            IntPtr engine;
+            Check(FwpmEngineOpen0(null, RpcAuthnDefault, IntPtr.Zero, ref session, out engine), "open the filtering engine");
+            var wfp = new Wfp(engine);
+            var sub = new SubLayer { SubLayerKey = SubLayerKey, Weight = 0xFFFF,
+                DisplayData = new DisplayData { Name = "LocalSubnetGuard", Description = "Keeps connected-subnet traffic on its adapter." } };
+            try { Check(FwpmSubLayerAdd0(engine, ref sub, IntPtr.Zero), "add the sublayer"); }
+            catch { wfp.Dispose(); throw; }
+            return wfp;
+        }
+
+        static Guid LayerFor(AddressFamily f) { return f == AddressFamily.InterNetwork ? LayerOutboundIpPacketV4 : LayerOutboundIpPacketV6; }
+
+        // Confirms the outbound IP packet layer for a family exists and has every field the filters use.
+        // Returns the layer's display name; throws with the details if not.
+        public string CheckLayer(AddressFamily f)
+        {
+            Guid key = LayerFor(f);
+            IntPtr p;
+            Check(FwpmLayerGetByKey0(_engine, ref key, out p), "find the " + Net.FamilyName(f) + " outbound IP packet layer " + key);
+            try
+            {
+                var layer = (Layer)Marshal.PtrToStructure(p, typeof(Layer));
+                var fields = new HashSet<Guid>();
+                int size = Marshal.SizeOf(typeof(Field));
+                for (int i = 0; i < layer.NumFields; i++)
+                {
+                    var fld = (Field)Marshal.PtrToStructure(new IntPtr(layer.Field.ToInt64() + (long)i * size), typeof(Field));
+                    fields.Add((Guid)Marshal.PtrToStructure(fld.FieldKey, typeof(Guid)));
+                }
+                foreach (var need in new[] { CondIpRemoteAddress, CondIpLocalInterface, CondFlags })
+                    if (!fields.Contains(need)) throw new InvalidOperationException("layer " + key + " has no field " + need);
+                return Marshal.PtrToStringUni(layer.Name);
+            }
+            finally { FwpmFreeMemory0(ref p); }
+        }
+
+        // Blocks outbound packets to `remote` that leave through the adapter with this LUID (except = false),
+        // or through any adapter but that one (except = true; loopback traffic, e.g. to this PC's own address,
+        // is never blocked). Returns the filter id.
+        public ulong AddBlock(Prefix remote, ulong ifLuid, bool except, string name)
+        {
+            var mem = new List<IntPtr>();
+            try
+            {
+                byte[] net = remote.NetworkBytes;
+                IntPtr addr;
+                uint addrType;
+                if (remote.Family == AddressFamily.InterNetwork)
+                {
+                    addr = Alloc(mem, 8); // FWP_V4_ADDR_AND_MASK { UINT32 addr; UINT32 mask; } in host byte order
+                    Marshal.WriteInt32(addr, 0, (int)((uint)net[0] << 24 | (uint)net[1] << 16 | (uint)net[2] << 8 | net[3]));
+                    Marshal.WriteInt32(addr, 4, (int)Subnet4Mask(remote.Length));
+                    addrType = FwpV4AddrMask;
+                }
+                else
+                {
+                    addr = Alloc(mem, 17); // FWP_V6_ADDR_AND_MASK { UINT8 addr[16]; UINT8 prefixLength; }
+                    Marshal.Copy(net, 0, addr, 16);
+                    Marshal.WriteByte(addr, 16, (byte)remote.Length);
+                    addrType = FwpV6AddrMask;
+                }
+                IntPtr luid = Alloc(mem, 8);
+                Marshal.WriteInt64(luid, (long)ifLuid);
+
+                var conds = new List<Condition>
+                {
+                    new Condition { FieldKey = CondIpRemoteAddress, MatchType = MatchEqual, ConditionValue = new Value { Type = addrType, Data = (ulong)addr.ToInt64() } },
+                    new Condition { FieldKey = CondIpLocalInterface, MatchType = except ? MatchNotEqual : MatchEqual, ConditionValue = new Value { Type = FwpUint64, Data = (ulong)luid.ToInt64() } },
+                };
+                if (except)
+                    conds.Add(new Condition { FieldKey = CondFlags, MatchType = MatchFlagsNoneSet, ConditionValue = new Value { Type = FwpUint32, Data = ConditionFlagIsLoopback } });
+
+                int size = Marshal.SizeOf(typeof(Condition));
+                IntPtr arr = Alloc(mem, size * conds.Count);
+                for (int i = 0; i < conds.Count; i++) Marshal.StructureToPtr(conds[i], new IntPtr(arr.ToInt64() + (long)i * size), false);
+
+                var filter = new Filter
+                {
+                    FilterKey = Guid.NewGuid(),
+                    DisplayData = new DisplayData { Name = name, Description = "Managed by LocalSubnetGuard; removed when it stops." },
+                    LayerKey = LayerFor(remote.Family),
+                    SubLayerKey = SubLayerKey,
+                    Weight = new Value { Type = FwpEmpty },
+                    NumFilterConditions = (uint)conds.Count,
+                    FilterCondition = arr,
+                    Action = new Action { Type = ActionBlock },
+                };
+                ulong id;
+                Check(FwpmFilterAdd0(_engine, ref filter, IntPtr.Zero, out id), "add the filter");
+                return id;
+            }
+            finally { foreach (var p in mem) Marshal.FreeHGlobal(p); }
+        }
+
+        static uint Subnet4Mask(int len) { return len == 0 ? 0u : uint.MaxValue << (32 - len); }
+
+        static IntPtr Alloc(List<IntPtr> mem, int size)
+        {
+            IntPtr p = Marshal.AllocHGlobal(size);
+            for (int i = 0; i < size; i++) Marshal.WriteByte(p, i, 0);
+            mem.Add(p);
+            return p;
+        }
+
+        public static ulong LuidOf(int ifIndex)
+        {
+            ulong luid;
+            int rc = ConvertInterfaceIndexToLuid((uint)ifIndex, out luid);
+            if (rc != 0) throw new InvalidOperationException(string.Format("could not get the LUID of interface {0}: error {1}", ifIndex, rc));
+            return luid;
+        }
+
+        static void Check(uint rc, string what)
+        {
+            if (rc != 0) throw new InvalidOperationException(string.Format("could not {0}: error 0x{1:X8}", what, rc));
+        }
+
+        // Closing the dynamic session's engine handle removes everything it added.
+        public void Dispose()
+        {
+            if (_engine != IntPtr.Zero) { FwpmEngineClose0(_engine); _engine = IntPtr.Zero; }
+        }
+    }
+
     // ------------------------------------------------------------------ neighbor table (IP Helper)
     enum NeighborState { Unreachable = 0, Incomplete = 1, Probe = 2, Delay = 3, Stale = 4, Reachable = 5, Permanent = 6 }
 
@@ -645,10 +928,11 @@ Log: " + Log.PathName);
         [DllImport("iphlpapi.dll")] static extern int DeleteIpNetEntry2(IntPtr row);
         [DllImport("iphlpapi.dll")] static extern int FlushIpPathTable(ushort family);
 
-        public static List<NeighborRow> Read(AddressFamily f) { return Scan(f, null); }
+        public static List<NeighborRow> Read(AddressFamily f) { return Scan(f, null, null); }
 
-        // Reads the neighbor table; the entries whose indices `pick` returns are deleted (never Permanent ones).
-        public static List<NeighborRow> Scan(AddressFamily f, Func<List<NeighborRow>, IEnumerable<int>> pick)
+        // Reads the neighbor table; the entries whose indices `pick` returns are deleted (never Permanent ones),
+        // and `deleted` is told each one's Win32 result.
+        public static List<NeighborRow> Scan(AddressFamily f, Func<List<NeighborRow>, IEnumerable<int>> pick, Action<NeighborRow, int> deleted)
         {
             var rows = new List<NeighborRow>();
             var ptrs = new List<IntPtr>();
@@ -670,13 +954,17 @@ Log: " + Log.PathName);
                 }
                 if (pick != null)
                     foreach (int i in pick(rows))
-                        if (rows[i].State != NeighborState.Permanent) DeleteIpNetEntry2(ptrs[i]);
+                        if (rows[i].State != NeighborState.Permanent)
+                        {
+                            int rc = DeleteIpNetEntry2(ptrs[i]);
+                            if (deleted != null) deleted(rows[i], rc);
+                        }
             }
             finally { FreeMibTable(t); }
             return rows;
         }
 
-        public static void FlushPathCache(AddressFamily f) { FlushIpPathTable(Net.Af(f)); }
+        public static int FlushPathCache(AddressFamily f) { return FlushIpPathTable(Net.Af(f)); }
     }
 
     // ------------------------------------------------------------------ cleanup of earlier versions

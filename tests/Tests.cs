@@ -114,12 +114,9 @@ namespace LocalSubnetGuard.Tests
         // ---------------------------------------------------------------- HoldTracker
         static NeighborRow Row(string ip, int ifIndex, NeighborState s) { return new NeighborRow { Addr = A(ip), IfIndex = ifIndex, State = s }; }
 
-        // Lab subnet with the lengthened timers: RetransmitTime 10 s, so entries are reset after 15 s.
         static Func<NeighborRow, HeldSubnet> LabMatch(string prefix)
         {
-            var h = new HeldSubnet { Prefix = P(prefix), IfIndex = 2, NicId = "{2}", NicName = "Lab NIC" };
-            h.SetResetAfter(10000);
-            var held = new List<HeldSubnet> { h };
+            var held = new List<HeldSubnet> { new HeldSubnet { Prefix = P(prefix), IfIndex = 2, NicId = "{2}", NicName = "Lab NIC" } };
             return r => Planner.Match(held, r);
         }
         static HoldTracker.Decision Pass(HoldTracker t, Func<NeighborRow, HeldSubnet> match, DateTime now, List<string> log, params NeighborRow[] rows)
@@ -127,77 +124,51 @@ namespace LocalSubnetGuard.Tests
             return t.Decide(rows.ToList(), match, now, log.Add);
         }
 
-        static void TestResetBeforeNudGivesUp()
+        // The sequence from a real trace: Probe, Unreachable, a lookup (Incomplete) that lasts while the device
+        // is down, and the answer when it is back. Nothing but Unreachable is ever deleted.
+        static void TestFailingNeighborIsWatchedAndHeld()
         {
             var match = LabMatch("192.168.50.0/24");
             var log = new List<string>();
             var t = new HoldTracker();
             var t0 = new DateTime(2026, 1, 1);
-            var dead = Row("192.168.50.9", 2, NeighborState.Incomplete);
 
-            Eq(0, Pass(t, match, t0, log, dead).Delete.Count, "just started resolving");
-            Eq(0, Pass(t, match, t0.AddSeconds(14.9), log, dead).Delete.Count, "still within half the budget");
-            var d = Pass(t, match, t0.AddSeconds(15), log, dead);
-            Eq("0", string.Join(",", d.Delete), "reset at 1.5 x RetransmitTime");
-            True(!d.Flush, "never reached Unreachable, so no path-cache flush");
-            True(log.Single().Contains("resetting"), "reset logged: " + log.Single());
+            var d = Pass(t, match, t0, log, Row("192.168.50.9", 2, NeighborState.Probe));
+            True(d.Urgent && d.Delete.Count == 0 && !d.Flush, "Probe: poll fast, delete nothing");
+            True(log.Single().Contains("watching it closely") && log.Single().Contains("Probe"), "logged: " + log.Single());
 
-            // Windows re-creates the entry on the next packet: a fresh countdown, and no new log line.
-            Eq(0, Pass(t, match, t0.AddSeconds(16), log, dead).Delete.Count, "new countdown");
-            Eq(0, Pass(t, match, t0.AddSeconds(30), log, dead).Delete.Count, "14 s into the new countdown");
-            Eq(1, Pass(t, match, t0.AddSeconds(31), log, dead).Delete.Count, "reset again");
-            Eq(1, log.Count, "one log line per episode");
+            Eq(0, Pass(t, match, t0.AddSeconds(29), log, Row("192.168.50.9", 2, NeighborState.Probe)).Delete.Count, "Probe is never deleted");
 
-            Pass(t, match, t0.AddSeconds(35), log, Row("192.168.50.9", 2, NeighborState.Reachable));
+            d = Pass(t, match, t0.AddSeconds(30), log, Row("192.168.50.9", 2, NeighborState.Unreachable));
+            Eq("0", string.Join(",", d.Delete), "Unreachable is held");
+            True(d.Flush && d.Urgent, "path cache flushed, still polling fast");
+            True(log.Last().Contains("marked Unreachable"), "logged: " + log.Last());
+
+            for (int s = 31; s <= 90; s += 10)
+            {
+                d = Pass(t, match, t0.AddSeconds(s), log, Row("192.168.50.9", 2, NeighborState.Incomplete));
+                True(d.Urgent && d.Delete.Count == 0, "Incomplete: poll fast, delete nothing (" + s + " s)");
+            }
+            Eq(2, log.Count, "no more log lines while it is down");
+
+            d = Pass(t, match, t0.AddSeconds(95), log, Row("192.168.50.9", 2, NeighborState.Reachable));
+            True(!d.Urgent, "back to the normal interval");
             Eq(0, t.Count, "released when it answers");
-            True(log.Last().Contains("answered") && log.Last().Contains("reset 2, held 0"), "release logged: " + log.Last());
+            True(log.Last().Contains("answered") && log.Last().Contains("held 1 time(s)"), "release logged: " + log.Last());
         }
 
-        static void TestProbeIsResetButDelayIsNot()
+        static void TestOnlyProtectedNeighborsCount()
         {
             var match = LabMatch("192.168.50.0/24");
             var log = new List<string>();
             var t = new HoldTracker();
-            var t0 = new DateTime(2026, 1, 1);
-
-            Pass(t, match, t0, log, Row("192.168.50.9", 2, NeighborState.Delay));
-            Eq(0, Pass(t, match, t0.AddSeconds(20), log, Row("192.168.50.9", 2, NeighborState.Delay)).Delete.Count, "Delay never counts down");
-            Pass(t, match, t0.AddSeconds(21), log, Row("192.168.50.9", 2, NeighborState.Probe));
-            Eq(1, Pass(t, match, t0.AddSeconds(36), log, Row("192.168.50.9", 2, NeighborState.Probe)).Delete.Count, "Probe is reset like Incomplete");
-        }
-
-        static void TestCountdownRestartsWhenNeighborRecovers()
-        {
-            var match = LabMatch("192.168.50.0/24");
-            var log = new List<string>();
-            var t = new HoldTracker();
-            var t0 = new DateTime(2026, 1, 1);
-
-            Pass(t, match, t0, log, Row("192.168.50.9", 2, NeighborState.Probe));
-            Pass(t, match, t0.AddSeconds(10), log, Row("192.168.50.9", 2, NeighborState.Reachable));
-            Pass(t, match, t0.AddSeconds(11), log, Row("192.168.50.9", 2, NeighborState.Probe));
-            Eq(0, Pass(t, match, t0.AddSeconds(20), log, Row("192.168.50.9", 2, NeighborState.Probe)).Delete.Count, "counted from the new Probe, not the old one");
-            Eq(0, log.Count, "nothing to report");
-        }
-
-        static void TestUnreachableIsHeldAsBackstop()
-        {
-            var match = LabMatch("192.168.50.0/24");
-            var log = new List<string>();
-            var t = new HoldTracker();
-            var t0 = new DateTime(2026, 1, 1);
-
-            var d = Pass(t, match, t0, log,
-                Row("192.168.50.9", 2, NeighborState.Unreachable),
+            var d = Pass(t, match, new DateTime(2026, 1, 1), log,
                 Row("192.168.1.9", 1, NeighborState.Unreachable),   // not protected
                 Row("192.168.50.10", 3, NeighborState.Unreachable), // right subnet, wrong adapter
-                Row("192.168.50.11", 2, NeighborState.Reachable));
-            Eq("0", string.Join(",", d.Delete), "only the protected Unreachable entry is deleted");
-            True(d.Flush, "path cache flushed: it may already point at the gateway");
-            True(log.Single().Contains("marked Unreachable"), "logged: " + log.Single());
-
-            Pass(t, match, t0.AddSeconds(5), log, Row("192.168.50.9", 2, NeighborState.Stale));
-            True(log.Last().Contains("answered") && log.Last().Contains("held 1"), "release logged: " + log.Last());
+                Row("192.168.50.11", 2, NeighborState.Reachable),
+                Row("192.168.50.12", 2, NeighborState.Delay),       // Delay does not fail by itself
+                Row("192.168.50.13", 2, NeighborState.Stale));
+            True(d.Delete.Count == 0 && !d.Flush && !d.Urgent && log.Count == 0 && t.Count == 0, "nothing to do");
         }
 
         static void TestEpisodeExpiresWithoutTraffic()
@@ -207,14 +178,14 @@ namespace LocalSubnetGuard.Tests
             var t = new HoldTracker();
             var t0 = new DateTime(2026, 1, 1);
 
-            Pass(t, match, t0, log, Row("fd00:50::9", 2, NeighborState.Incomplete));
-            Pass(t, match, t0.AddSeconds(15), log, Row("fd00:50::9", 2, NeighborState.Incomplete)); // reset; nothing sends to it again
-            Eq(0, Pass(t, match, t0.AddSeconds(30), log).Delete.Count, "entry gone: nothing to delete");
+            Pass(t, match, t0, log, Row("fd00:50::9", 2, NeighborState.Unreachable)); // held; nothing sends to it again
+            AssertIdle(Pass(t, match, t0.AddSeconds(30), log));
             Eq(1, t.Count, "still tracked within expiry");
-            Pass(t, match, t0.AddSeconds(15) + HoldTracker.Expiry + TimeSpan.FromSeconds(1), log);
+            Pass(t, match, t0 + HoldTracker.Expiry + TimeSpan.FromSeconds(1), log);
             Eq(0, t.Count, "dropped after expiry");
             True(log.Last().Contains("fd00:50::9") && log.Last().Contains("no longer tracking"), "expiry logged: " + log.Last());
         }
+        static void AssertIdle(HoldTracker.Decision d) { True(!d.Urgent && d.Delete.Count == 0, "entry gone: back to the normal interval"); }
 
         // ---------------------------------------------------------------- native layouts (read-only)
         static void TestNativeLayouts()
