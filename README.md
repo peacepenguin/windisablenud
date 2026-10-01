@@ -53,8 +53,9 @@ IPv4 and IPv6, in three layers:
 2. **Hold, fast.** When a neighbor is marked Unreachable, the service deletes the entry and flushes the
    path cache. Windows then re-resolves the address on the local adapter instead of re-routing it to the
    gateway. Unreachable only ever follows a failing probe (state Probe) or lookup (state Incomplete), so
-   while any protected neighbor is in one of those states the service checks every 10 ms instead of
-   every 250 ms. It catches the Unreachable within about 10-16 ms (Windows' timer granularity).
+   while any protected neighbor is in one of those states the service checks every 100 ms instead of
+   every 500 ms. It catches the Unreachable within about 100 ms, and resets an entry that stays in Incomplete for more than 5 s or
+   Probe for more than 12 s (stuck: seen about once in 20-50 cycles). (The WFP block, not this speed, is what prevents leaks.)
 
 The Unreachable itself can't be prevented. Deleting an entry while it is in Probe or Incomplete, to
 restart the countdown, makes Windows mark the neighbor Unreachable immediately (seen in traces), so the
@@ -65,7 +66,7 @@ What to expect when a device stops answering:
 - **Outages shorter than about 30 s** (device reboot, switch restart) never reach Unreachable, so no
   traffic leaves via the gateway.
 - **Longer outages** reach Unreachable once, about 30 s after probing starts. Traffic can go out the
-  gateway for the ~10-16 ms until the hold catches it. After that, Windows keeps looking the device up
+  gateway for the ~100 ms until the hold catches it. After that, Windows keeps looking the device up
   (state Incomplete) for as long as traffic continues. In traces this lasted without another Unreachable,
   and the device was found again as soon as it answered.
 
@@ -88,7 +89,7 @@ Build with `build.cmd`, or download the exe from the CI artifacts. Then, from an
 
 ```
 LocalSubnetGuard.exe install [intervalMs] [slowtimers]
-                                            install + start the service (default 250 ms)
+                                            install + start the service (default 500 ms)
 LocalSubnetGuard.exe uninstall              stop + remove the service (restores the NUD timers)
 LocalSubnetGuard.exe run [intervalMs] [trace] [slowtimers]
                                             run in this console (Ctrl+C to stop and restore the timers);

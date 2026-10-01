@@ -174,26 +174,43 @@ namespace LocalSubnetGuard.Tests
             True(d.Urgent && d.Delete.Count == 0 && !d.Flush, "Probe: poll fast, delete nothing");
             True(log.Single().Contains("watching it closely") && log.Single().Contains("Probe"), "logged: " + log.Single());
 
-            Eq(0, Pass(t, match, t0.AddSeconds(29), log, Row("192.168.50.9", 2, NeighborState.Probe)).Delete.Count, "Probe is never deleted");
+            d = Pass(t, match, t0.AddSeconds(9), log, Row("192.168.50.9", 2, NeighborState.Probe));
+            True(d.Delete.Count == 0 && !d.Flush, "A normal Probe is never deleted");
 
             d = Pass(t, match, t0.AddSeconds(30), log, Row("192.168.50.9", 2, NeighborState.Unreachable));
             Eq("0", string.Join(",", d.Delete), "Unreachable is held");
             True(d.Flush && d.Urgent, "path cache flushed, still polling fast");
             True(log.Last().Contains("marked Unreachable"), "logged: " + log.Last());
 
-            for (int s = 31; s <= 90; s += 10)
+            for (int s = 31; s <= 34; s++)
             {
                 d = Pass(t, match, t0.AddSeconds(s), log, Row("192.168.50.9", 2, NeighborState.Incomplete));
                 True(d.Urgent && d.Delete.Count == 0, "Incomplete: poll fast, delete nothing (" + s + " s)");
             }
             for (int i = 0; i < 5; i++)
-                Pass(t, match, t0.AddSeconds(30.1 + i * 0.016), log, Row("192.168.50.9", 2, NeighborState.Unreachable));
+                Pass(t, match, t0.AddSeconds(34.1 + i * 0.016), log, Row("192.168.50.9", 2, NeighborState.Unreachable));
             Eq(2, log.Count, "no more log lines while it is down, even if Unreachable keeps coming back");
 
             d = Pass(t, match, t0.AddSeconds(95), log, Row("192.168.50.9", 2, NeighborState.Reachable));
             True(!d.Urgent, "back to the normal interval");
             Eq(0, t.Count, "released when it answers");
             True(log.Last().Contains("answered") && log.Last().Contains("held 6 time(s)"),"release logged: " + log.Last());
+        }
+
+        static void TestStuckNeighborIsReset()
+        {
+            var match = LabMatch("192.168.50.0/24");
+            var log = new List<string>();
+            var t = new HoldTracker();
+            var t0 = new DateTime(2026, 1, 1);
+            Pass(t, match, t0, log, Row("192.168.50.9", 2, NeighborState.Incomplete));
+            var d = Pass(t, match, t0.AddSeconds(4), log, Row("192.168.50.9", 2, NeighborState.Incomplete));
+            True(d.Delete.Count == 0 && !d.Flush, "not stuck yet");
+            d = Pass(t, match, t0.AddSeconds(6), log, Row("192.168.50.9", 2, NeighborState.Incomplete));
+            True(d.Delete.Count == 1 && d.Flush && d.Urgent, "stuck: entry deleted and path cache flushed");
+            True(log.Last().Contains("resetting"), "logged: " + log.Last());
+            d = Pass(t, match, t0.AddSeconds(7), log, Row("192.168.50.9", 2, NeighborState.Incomplete));
+            True(d.Delete.Count == 0, "the countdown restarts after a reset");
         }
 
         static void TestOnlyProtectedNeighborsCount()

@@ -14,7 +14,7 @@
 //  2. Hold      a neighbor in one of the adapter's subnets that is marked Unreachable anyway has its
 //               entry deleted and the path cache flushed, so Windows re-resolves it on the local adapter
 //               instead of re-routing it. While a neighbor is failing (Probe or Incomplete) the neighbor
-//               table is polled every 10 ms instead of every interval, so this happens within ~10-16 ms.
+//               table is polled every 100 ms instead of every interval, so this happens within ~100 ms.
 //               Unreachable itself cannot be prevented: deleting an entry that is in Probe or Incomplete
 //               makes Windows mark it Unreachable at once.
 //
@@ -23,7 +23,7 @@
 // Build: build.cmd (uses the .NET Framework 4.x csc.exe that ships with Windows).
 //
 // Usage (elevated, except status):
-//   LocalSubnetGuard.exe install [intervalMs] [slowtimers]   install + start as a Windows service (default 250 ms)
+//   LocalSubnetGuard.exe install [intervalMs] [slowtimers]   install + start as a Windows service (default 500 ms)
 //   LocalSubnetGuard.exe uninstall              stop + remove the service (restores the NUD timers)
 //   LocalSubnetGuard.exe run [intervalMs] [trace]
 //                                               run in this console (Ctrl+C to stop and restore the timers);
@@ -50,9 +50,16 @@ namespace LocalSubnetGuard
     static class Program
     {
         public const string ServiceName = "LocalSubnetGuard";
-        public const int DefaultIntervalMs = 250;
+        public const int DefaultIntervalMs = 500;
 
         static int Main(string[] args)
+        {
+            int rc = Run(args);
+            Log.Flush();
+            return rc;
+        }
+
+        static int Run(string[] args)
         {
             string cmd = args.Length > 0 ? args[0].ToLowerInvariant().TrimStart('-', '/') : "help";
             int interval;
@@ -114,7 +121,7 @@ namespace LocalSubnetGuard
             Console.WriteLine(
 @"LocalSubnetGuard - keep connected-subnet traffic on its adapter (works around NUD failover)
 
-  LocalSubnetGuard.exe install [intervalMs] [slowtimers]   install + start the service (default 250 ms)
+  LocalSubnetGuard.exe install [intervalMs] [slowtimers]   install + start the service (default 500 ms)
   LocalSubnetGuard.exe uninstall              stop + remove the service (restores the NUD timers)
   LocalSubnetGuard.exe run [intervalMs] [trace]
                                               run in this console (Ctrl+C to stop and restore the timers);
@@ -243,14 +250,14 @@ Log: " + Log.PathName);
     {
         class Tuned { public string NicId, NicName; public AddressFamily Family; public int OrigBase, OrigRetransmit; }
 
-        const int FastIntervalMs = 10; // poll interval while a protected neighbor is failing
+        const int FastIntervalMs = 100; // poll interval while a protected neighbor is failing
 
         readonly int _intervalMs;
         readonly HoldTracker _hold4 = new HoldTracker(), _hold6 = new HoldTracker();
         readonly Dictionary<string, Tuned> _tuned = new Dictionary<string, Tuned>(); // adapter id|family -> original timers
         readonly HashSet<string> _tuneFailures = new HashSet<string>();
         readonly Dictionary<string, NeighborState> _traced = new Dictionary<string, NeighborState>(); // trace: last state seen
-        List<HeldSubnet> _held = new List<HeldSubnet>();
+        volatile List<HeldSubnet> _held = new List<HeldSubnet>();
         string _lastSig;
 
         // WFP block filters, one per protected subnet (key: prefix|adapter LUID). The dynamic session removes them
@@ -262,8 +269,7 @@ Log: " + Log.PathName);
         public bool SlowTimers; // lengthen the NUD timers on protected adapters (off by default)
         public bool Trace; // log every state change of protected neighbors, and every entry deleted
         volatile bool _refresh = true;
-        DateTime _nextRefresh = DateTime.MinValue;
-        Thread _thread;
+        Thread _thread, _configThread; // the hold loop must never wait for the (slower) configuration refresh
         readonly ManualResetEvent _stop = new ManualResetEvent(false);
 
         public Guard(int intervalMs) { _intervalMs = intervalMs; }
@@ -276,7 +282,9 @@ Log: " + Log.PathName);
             NetworkChange.NetworkAddressChanged += OnNetChange;
             NetworkChange.NetworkAvailabilityChanged += OnNetAvailability;
             _thread = new Thread(Loop) { IsBackground = true, Name = "LocalSubnetGuard" };
+            _configThread = new Thread(ConfigLoop) { IsBackground = true, Name = "LocalSubnetGuard-config" };
             _thread.Start();
+            _configThread.Start();
         }
 
         // With restoreTimers, NUD timers go back to their original values on every adapter still present.
@@ -286,6 +294,7 @@ Log: " + Log.PathName);
             NetworkChange.NetworkAvailabilityChanged -= OnNetAvailability;
             _stop.Set();
             if (_thread != null) _thread.Join(5000);
+            if (_configThread != null) _configThread.Join(5000);
             DropWfp();
             if (restoreTimers)
             {
@@ -303,23 +312,32 @@ Log: " + Log.PathName);
         void OnNetChange(object s, EventArgs e) { _refresh = true; }
         void OnNetAvailability(object s, NetworkAvailabilityEventArgs e) { _refresh = true; }
 
+        // Hold loop: only reads the neighbor table and deletes failing entries. It never waits for anything slow.
         void Loop()
         {
             while (!_stop.WaitOne(0))
             {
                 bool urgent = false;
-                try
-                {
-                    if (_refresh || DateTime.UtcNow >= _nextRefresh)
-                    {
-                        _refresh = false;
-                        _nextRefresh = DateTime.UtcNow.AddSeconds(5);
-                        Refresh();
-                    }
-                    urgent = Tick();
-                }
+                var sw = Stopwatch.StartNew();
+                try { urgent = Tick(); }
                 catch (Exception ex) { Log.Write("ERROR: " + ex.Message); }
+                if (sw.ElapsedMilliseconds > 500) Log.Write(string.Format("WARNING: a hold pass took {0} ms", sw.ElapsedMilliseconds));
                 _stop.WaitOne(urgent ? Math.Min(FastIntervalMs, _intervalMs) : _intervalMs);
+            }
+        }
+
+        // Configuration loop: follows the live network configuration (adapters, NUD timers, WFP filters) on every
+        // network change and every 5 seconds. It can be slow (netsh, WFP, adapter enumeration) without delaying the hold.
+        void ConfigLoop()
+        {
+            while (!_stop.WaitOne(0))
+            {
+                _refresh = false;
+                var sw = Stopwatch.StartNew();
+                try { Refresh(); }
+                catch (Exception ex) { Log.Write("ERROR: " + ex.Message); }
+                if (sw.ElapsedMilliseconds > 1000) Log.Write(string.Format("WARNING: a configuration refresh took {0} ms", sw.ElapsedMilliseconds));
+                for (int i = 0; i < 50 && !_refresh && !_stop.WaitOne(100); i++) { }
             }
         }
 
@@ -531,11 +549,15 @@ Log: " + Log.PathName);
     // seen in Probe, Incomplete or Unreachable (no more traffic to it).
     class HoldTracker
     {
-        class Episode { public string Nic; public DateTime Since, LastSeen; public int Holds; }
+        class Episode { public string Nic; public DateTime Since, LastSeen; public int Holds; public NeighborState State = (NeighborState)(-1); public DateTime StateSince; }
 
         public class Decision { public List<int> Delete = new List<int>(); public bool Flush, Urgent; }
 
         public static readonly TimeSpan Expiry = TimeSpan.FromSeconds(60);
+        // Windows leaves Incomplete after ~3 s and Probe after at most ~8 s. A neighbor that stays in either far
+        // longer is stuck (traces showed it staying Incomplete while traffic leaked to the blocked gateway):
+        // its entry is deleted so resolution starts over.
+        public static readonly TimeSpan StuckAfterIncomplete = TimeSpan.FromSeconds(5), StuckAfterProbe = TimeSpan.FromSeconds(12);
         readonly Dictionary<string, Episode> _episodes = new Dictionary<string, Episode>();
 
         public int Count { get { return _episodes.Count; } }
@@ -551,7 +573,15 @@ Log: " + Log.PathName);
                 if (r.State == NeighborState.Probe || r.State == NeighborState.Incomplete)
                 {
                     d.Urgent = true;
-                    Touch(r, h, now, log, "{0} is not answering on '{1}' ({2}) - watching it closely");
+                    var e = Touch(r, h, now, log, "{0} is not answering on '{1}' ({2}) - watching it closely");
+                    if (e.State != r.State) { e.State = r.State; e.StateSince = now; }
+                    else if (now - e.StateSince > (r.State == NeighborState.Incomplete ? StuckAfterIncomplete : StuckAfterProbe))
+                    {
+                        d.Delete.Add(i);
+                        d.Flush = true;
+                        log(string.Format("{0} has been in state {1} on '{2}' for {3:0}s - resetting its entry", r.Address, r.State, h.NicName, (now - e.StateSince).TotalSeconds));
+                        e.StateSince = now;
+                    }
                 }
                 else if (r.State == NeighborState.Unreachable)
                 {
@@ -559,6 +589,7 @@ Log: " + Log.PathName);
                     d.Flush = true;
                     d.Urgent = true;
                     var e = Touch(r, h, now, log, null);
+                    if (e.State != r.State) { e.State = r.State; e.StateSince = now; }
                     // Windows re-creates the entry as Unreachable while traffic continues: log only the first hold.
                     if (e.Holds++ == 0)
                         log(string.Format("{0} was marked Unreachable on '{1}' - holding it on the local adapter (repeats are not logged)", r.Address, h.NicName));
@@ -1256,18 +1287,45 @@ Log: " + Log.PathName);
     }
 
     // ------------------------------------------------------------------ logging
+    // Writes happen on a background thread, so a blocked console (e.g. text selected in a QuickEdit window)
+    // or a slow disk can never stall the guard.
     static class Log
     {
         public static bool Echo;
         static readonly object _lock = new object();
+        static readonly System.Collections.Concurrent.BlockingCollection<string> _queue = new System.Collections.Concurrent.BlockingCollection<string>();
+        static Thread _writer;
         public static string PathName { get { return Path.Combine(DataDir.Location, "LocalSubnetGuard.log"); } }
 
         public static void Write(string msg)
         {
             string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + msg;
-            if (Echo) Console.WriteLine(line);
             lock (_lock)
             {
+                if (_writer == null)
+                {
+                    _writer = new Thread(Drain) { IsBackground = true, Name = "LocalSubnetGuard-log" };
+                    _writer.Start();
+                }
+            }
+            try { _queue.Add(line); } catch (InvalidOperationException) { } // already shut down
+        }
+
+        // Waits (briefly) for queued lines to be written; call before the process exits.
+        public static void Flush()
+        {
+            Thread w;
+            lock (_lock) { w = _writer; }
+            if (w == null) return;
+            try { _queue.CompleteAdding(); } catch { }
+            w.Join(2000);
+        }
+
+        static void Drain()
+        {
+            foreach (var line in _queue.GetConsumingEnumerable())
+            {
+                if (Echo) { try { Console.WriteLine(line); } catch { } }
                 try
                 {
                     Directory.CreateDirectory(DataDir.Location);
