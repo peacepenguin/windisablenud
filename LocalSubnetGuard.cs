@@ -205,7 +205,8 @@ Log: " + Log.PathName);
                     n.Prefixes.Count == 0 ? "-" : string.Join(", ", n.Prefixes));
             }
 
-            Console.WriteLine("Protected subnets (neighbors marked Unreachable are held on the adapter):");
+            Console.WriteLine("Settings ({0}): {1}", Config.PathName, Config.Load(new List<string>(), null));
+            Console.WriteLine("Protected subnets:");
             if (held.Count == 0) Console.WriteLine("  (none: every connected adapter has a default gateway)");
             foreach (var h in held)
             {
@@ -265,6 +266,10 @@ Log: " + Log.PathName);
         readonly Dictionary<string, ulong> _filters = new Dictionary<string, ulong>();
         string _wfpError, _lastAmbiguous = "";
 
+        volatile Config _cfg = new Config(); // the settings file, re-read by every refresh
+        string _cfgSig;
+        readonly HashSet<string> _cfgWarned = new HashSet<string>();
+
         public bool SlowTimers; // lengthen the NUD timers on protected adapters (off by default)
         public bool Trace; // log every state change of protected neighbors, and every entry deleted
         volatile bool _refresh = true;
@@ -277,6 +282,7 @@ Log: " + Log.PathName);
         {
             Log.Write(string.Format("Starting (interval {0} ms).", _intervalMs));
             DataDir.Secure();
+            Config.CreateIfMissing();
             Legacy.Cleanup();
             NetworkChange.NetworkAddressChanged += OnNetChange;
             NetworkChange.NetworkAvailabilityChanged += OnNetAvailability;
@@ -339,8 +345,24 @@ Log: " + Log.PathName);
             }
         }
 
+        void LoadConfig()
+        {
+            var warnings = new List<string>();
+            var cfg = Config.Load(warnings, _cfg);
+            foreach (var w in warnings)
+                if (_cfgWarned.Add(w)) Log.Write("WARNING: " + w);
+            if (cfg.ToString() != _cfgSig)
+            {
+                _cfgSig = cfg.ToString();
+                Log.Write(string.Format("Settings ({0}): {1}.", Config.PathName, cfg));
+                if (!cfg.WfpBlock && !cfg.DeleteFlush) Log.Write("WARNING: wfpblock and deleteflush are both off: nothing is being done.");
+            }
+            _cfg = cfg;
+        }
+
         void Refresh()
         {
+            LoadConfig();
             var snap = Net.Snapshot();
             var held = Planner.Build(snap);
             ApplyTimers(snap, held);
@@ -373,11 +395,12 @@ Log: " + Log.PathName);
         {
             var ambiguous = new List<HeldSubnet>();
             var want = new Dictionary<string, HeldSubnet>();
-            foreach (var h in Planner.Blockable(snap, held, ambiguous))
-            {
-                try { want[h.Prefix + "|" + Wfp.LuidOf(h.IfIndex)] = h; }
-                catch (InvalidOperationException ex) { Log.Write("ERROR: " + ex.Message); }
-            }
+            if (_cfg.WfpBlock) // off: no wanted filters, so any installed ones are removed below
+                foreach (var h in Planner.Blockable(snap, held, ambiguous))
+                {
+                    try { want[h.Prefix + "|" + Wfp.LuidOf(h.IfIndex)] = h; }
+                    catch (InvalidOperationException ex) { Log.Write("ERROR: " + ex.Message); }
+                }
             string amb = string.Join(", ", ambiguous.Select(h => h.Prefix + " on '" + h.NicName + "'"));
             if (amb != _lastAmbiguous)
             {
@@ -490,6 +513,12 @@ Log: " + Log.PathName);
             {
                 var held = all.Where(h => h.Prefix.Family == fam).ToList();
                 var tracker = fam == AddressFamily.InterNetwork ? _hold4 : _hold6;
+                if (!_cfg.DeleteFlush)
+                {
+                    tracker.Reset();
+                    if (Trace && held.Count > 0) TraceStates(Neighbors.Read(fam).Where(r => Planner.Match(held, r) != null), fam);
+                    continue;
+                }
                 if (held.Count == 0 && tracker.Count == 0) continue;
                 bool flush = false;
                 var rows = Neighbors.Scan(fam, table =>
@@ -555,6 +584,8 @@ Log: " + Log.PathName);
         readonly Dictionary<string, Episode> _episodes = new Dictionary<string, Episode>();
 
         public int Count { get { return _episodes.Count; } }
+
+        public void Reset() { _episodes.Clear(); }
 
         public Decision Decide(IList<NeighborRow> rows, Func<NeighborRow, HeldSubnet> protecting, DateTime now, Action<string> log)
         {
@@ -1276,6 +1307,91 @@ Log: " + Log.PathName);
                 Directory.SetAccessControl(Location, sec);
             }
             catch (Exception ex) { Log.Write("WARNING: could not secure " + Location + ": " + ex.Message); }
+        }
+    }
+
+    // ------------------------------------------------------------------ settings file
+    // %ProgramData%\LocalSubnetGuard\LocalSubnetGuard.conf (writable by SYSTEM and Administrators only), re-read
+    // every few seconds, so changes need no restart:
+    //   wfpblock=yes|no     the WFP filters that drop packets for a protected subnet leaving through another adapter
+    //   deleteflush=yes|no  deleting failing neighbor entries (and flushing the path cache for Unreachable ones)
+    // Each works on its own; both default to yes.
+    sealed class Config
+    {
+        public bool WfpBlock = true, DeleteFlush = true;
+
+        public static string PathName { get { return Path.Combine(DataDir.Location, "LocalSubnetGuard.conf"); } }
+
+        public override string ToString()
+        {
+            return string.Format("wfpblock={0}, deleteflush={1}", WfpBlock ? "yes" : "no", DeleteFlush ? "yes" : "no");
+        }
+
+        const string Template =
+@"# LocalSubnetGuard settings. Changes are picked up within a few seconds; no restart needed.
+# Each setting works on its own. Values: yes / no.
+
+# Drop packets for a protected subnet that would leave through any other adapter (Windows Filtering Platform).
+wfpblock=yes
+
+# Delete failing neighbor entries (Unreachable, or stuck in Incomplete / Probe) so Windows looks the device
+# up again on the local adapter; the path cache is flushed for Unreachable ones.
+deleteflush=yes
+";
+
+        public static Config Parse(IEnumerable<string> lines, List<string> warnings)
+        {
+            var c = new Config();
+            int n = 0;
+            foreach (var raw in lines)
+            {
+                n++;
+                string line = raw;
+                int hash = line.IndexOf('#');
+                if (hash >= 0) line = line.Substring(0, hash);
+                line = line.Trim();
+                if (line.Length == 0) continue;
+                int eq = line.IndexOf('=');
+                if (eq < 0) { warnings.Add(string.Format("settings line {0}: expected key=value, got '{1}'", n, line)); continue; }
+                string key = line.Substring(0, eq).Trim().ToLowerInvariant(), val = line.Substring(eq + 1).Trim().ToLowerInvariant();
+                bool b;
+                if (key != "wfpblock" && key != "deleteflush") { warnings.Add(string.Format("settings line {0}: unknown setting '{1}'", n, key)); continue; }
+                if (!TryBool(val, out b)) { warnings.Add(string.Format("settings line {0}: '{1}' must be yes or no, not '{2}'; using the default", n, key, val)); continue; }
+                if (key == "wfpblock") c.WfpBlock = b; else c.DeleteFlush = b;
+            }
+            return c;
+        }
+
+        static bool TryBool(string v, out bool b)
+        {
+            b = false;
+            switch (v)
+            {
+                case "yes": case "true": case "on": case "1": b = true; return true;
+                case "no": case "false": case "off": case "0": return true;
+                default: return false;
+            }
+        }
+
+        // The file's settings; defaults if it does not exist; `previous` (if any) if it cannot be read.
+        public static Config Load(List<string> warnings, Config previous)
+        {
+            try
+            {
+                if (!File.Exists(PathName)) return new Config();
+                return Parse(File.ReadAllLines(PathName), warnings);
+            }
+            catch (Exception ex)
+            {
+                warnings.Add("could not read " + PathName + ": " + ex.Message);
+                return previous ?? new Config();
+            }
+        }
+
+        public static void CreateIfMissing()
+        {
+            try { if (!File.Exists(PathName)) File.WriteAllText(PathName, Template.Replace("\r\n", "\n").Replace("\n", Environment.NewLine)); }
+            catch (Exception ex) { Log.Write("WARNING: could not create " + PathName + ": " + ex.Message); }
         }
     }
 

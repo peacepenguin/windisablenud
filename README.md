@@ -73,6 +73,22 @@ Costs on the protected adapters:
 - On IPv6, duplicate address detection waits one retransmit time, so a new IPv6 address on the adapter
   takes about 10 s to become usable.
 
+## Settings
+
+`C:\ProgramData\LocalSubnetGuard\LocalSubnetGuard.conf` is created on first start and re-read every few
+seconds, so changes need no restart. Only SYSTEM and Administrators can write to it.
+
+```
+wfpblock=yes       # the WFP filters that stop packets leaving through the wrong adapter
+deleteflush=yes    # deleting failing neighbor entries (and flushing the path cache for Unreachable ones)
+```
+
+The two approaches work on their own. `wfpblock=yes, deleteflush=no` only guarantees nothing leaks (pings to
+a failed device show "General failure" until Windows retries the device itself). `wfpblock=no,
+deleteflush=yes` keeps Windows from failing over in the first place, but a packet can still leave through
+the gateway in the moments before an entry is cleared. `status` shows the current values and the log says
+when they change.
+
 ## Usage
 
 Build with `build.cmd`, or download the exe from the CI artifacts. Then, from an elevated prompt:

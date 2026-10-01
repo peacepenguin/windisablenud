@@ -148,6 +148,38 @@ namespace LocalSubnetGuard.Tests
             Eq("192.168.50.0/24 on Lab NIC,fd00:50::/64 on Lab NIC", Blockable(out amb, wan, Lab()), "down adapter ignored");
         }
 
+        // ---------------------------------------------------------------- settings file
+        static Config Cfg(out List<string> warnings, params string[] lines)
+        {
+            warnings = new List<string>();
+            return Config.Parse(lines, warnings);
+        }
+
+        static void TestConfigDefaultsAndValues()
+        {
+            List<string> w;
+            var c = Cfg(out w);
+            True(c.WfpBlock && c.DeleteFlush && w.Count == 0, "an empty file means both on");
+            c = Cfg(out w, "# comment", "", "wfpblock=no", "  DeleteFlush = YES   # trailing comment");
+            True(!c.WfpBlock && c.DeleteFlush && w.Count == 0, "keys and values are case-insensitive, comments ignored");
+            c = Cfg(out w, "wfpblock=off", "deleteflush=0");
+            True(!c.WfpBlock && !c.DeleteFlush && w.Count == 0, "off and 0 mean no");
+            c = Cfg(out w, "wfpblock=true", "deleteflush=on");
+            True(c.WfpBlock && c.DeleteFlush && w.Count == 0, "true and on mean yes");
+            Eq("wfpblock=no, deleteflush=yes", Cfg(out w, "wfpblock=no").ToString(), "formatting");
+        }
+
+        static void TestConfigProblemsWarnAndKeepDefaults()
+        {
+            List<string> w;
+            var c = Cfg(out w, "wfpblock=maybe", "bogus=yes", "nonsense");
+            True(c.WfpBlock && c.DeleteFlush, "bad values keep the defaults");
+            Eq(3, w.Count, "one warning each");
+            True(w[0].Contains("line 1") && w[0].Contains("yes or no"), w[0]);
+            True(w[1].Contains("unknown setting 'bogus'"), w[1]);
+            True(w[2].Contains("expected key=value"), w[2]);
+        }
+
         // ---------------------------------------------------------------- HoldTracker
         static NeighborRow Row(string ip, int ifIndex, NeighborState s) { return new NeighborRow { Addr = A(ip), IfIndex = ifIndex, State = s }; }
 
