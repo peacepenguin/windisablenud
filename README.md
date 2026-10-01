@@ -25,9 +25,24 @@ setting it to `disabled` always fails with "The parameter is incorrect".
 ## What it does
 
 The service acts on every connected adapter that has **no default gateway**, checked separately for
-IPv4 and IPv6, in two layers:
+IPv4 and IPv6, in three layers:
 
-1. **Slow NUD down.** NUD's timers can be changed even though NUD can't be turned off. By default
+0. **Block the leak (Windows Filtering Platform).** For each protected subnet the service installs a WFP
+   filter at the outbound IP-packet layer that drops any packet to that subnet leaving through *any other*
+   adapter (loopback excepted). Unlike firewall rules this sees every packet, after routing, so whatever
+   NUD does to the routing table, nothing for the lab subnet can reach the default gateway. The filters
+   live in a dynamic WFP session: if the service or its process dies for any reason, Windows removes them,
+   so a crash can never leave a subnet blocked. They follow the live configuration and are re-checked
+   every 5 s (and reinstalled if the Base Filtering Engine restarts). If another connected adapter also
+   has an address in the same range, traffic may legitimately use either, so that subnet is not blocked
+   (a warning is logged). The service depends on the Base Filtering Engine (`BFE`).
+
+   The two layers below keep the connection *working* (device re-resolved on the right adapter); this
+   one guarantees it can't *leak*.
+
+1. **Slow NUD down (optional, `slowtimers`).** Off by default: with the WFP block in place a leak is
+   impossible, and long timers make Windows wait up to 10 s before asking again for a device that comes
+   back. Existing lengthened timers are restored to the defaults at startup. When enabled, NUD's timers can be changed even though NUD can't be turned off. By default
    Windows probes a neighbor 3 times, 1 s apart, and marks it Unreachable if none of the probes is
    answered, so about 3 s of silence is enough to trigger failover. The service sets
    `retransmittime=10000` and `basereachabletime=120000` on the adapter, so a neighbor has to be silent
@@ -72,11 +87,14 @@ Costs on the protected adapters:
 Build with `build.cmd`, or download the exe from the CI artifacts. Then, from an elevated prompt:
 
 ```
-LocalSubnetGuard.exe install [intervalMs]   install + start the service (default 250 ms)
+LocalSubnetGuard.exe install [intervalMs] [slowtimers]
+                                            install + start the service (default 250 ms)
 LocalSubnetGuard.exe uninstall              stop + remove the service (restores the NUD timers)
-LocalSubnetGuard.exe run [intervalMs] [trace]
+LocalSubnetGuard.exe run [intervalMs] [trace] [slowtimers]
                                             run in this console (Ctrl+C to stop and restore the timers);
                                             'trace' also logs every state change of protected neighbors
+LocalSubnetGuard.exe wfptest <cidr> on|except <adapter>
+                                            diagnostic: install one WFP block filter until Enter
 LocalSubnetGuard.exe status                 show adapters, protected subnets, NUD timers and neighbors
 ```
 

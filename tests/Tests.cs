@@ -111,6 +111,43 @@ namespace LocalSubnetGuard.Tests
             Eq("", Held(Build(Wan(), lab)), "follows the live configuration");
         }
 
+        static void TestOverlaps()
+        {
+            True(P("10.0.0.0/8").Overlaps(P("10.1.1.0/24")) && P("10.1.1.0/24").Overlaps(P("10.0.0.0/8")), "contained");
+            True(P("10.1.1.0/24").Overlaps(P("10.1.1.0/24")), "same");
+            True(!P("10.1.1.0/24").Overlaps(P("10.1.2.0/24")), "disjoint");
+            True(!P("10.1.1.0/24").Overlaps(P("fd00::/64")), "family mismatch");
+        }
+
+        static string Blockable(out string ambiguous, params NicInfo[] nics)
+        {
+            var snap = new NetSnapshot { Nics = nics.ToList() };
+            var amb = new List<HeldSubnet>();
+            var ok = Planner.Blockable(snap, Planner.Build(snap), amb);
+            ambiguous = Held(amb);
+            return Held(ok);
+        }
+
+        static void TestBlocksCoverProtectedSubnets()
+        {
+            string amb;
+            Eq("192.168.50.0/24 on Lab NIC,fd00:50::/64 on Lab NIC", Blockable(out amb, Wan(), Lab()), "lab subnets blocked");
+            Eq("", amb, "none ambiguous");
+            Eq("", Blockable(out amb, Wan()), "no gateway-less adapter, no blocks");
+        }
+
+        static void TestOverlappingSubnetIsNotBlocked()
+        {
+            string amb;
+            // The other adapter also has an address in 192.168.50.0/24: traffic may legitimately use either.
+            var wan = Nic(1, "Ethernet", true, true, "192.168.50.0/24");
+            Eq("fd00:50::/64 on Lab NIC", Blockable(out amb, wan, Lab()), "only the unique subnet is blocked");
+            Eq("192.168.50.0/24 on Lab NIC", amb, "overlap reported");
+            // A disconnected adapter's addresses do not count.
+            wan.Up = false;
+            Eq("192.168.50.0/24 on Lab NIC,fd00:50::/64 on Lab NIC", Blockable(out amb, wan, Lab()), "down adapter ignored");
+        }
+
         // ---------------------------------------------------------------- HoldTracker
         static NeighborRow Row(string ip, int ifIndex, NeighborState s) { return new NeighborRow { Addr = A(ip), IfIndex = ifIndex, State = s }; }
 
@@ -149,12 +186,14 @@ namespace LocalSubnetGuard.Tests
                 d = Pass(t, match, t0.AddSeconds(s), log, Row("192.168.50.9", 2, NeighborState.Incomplete));
                 True(d.Urgent && d.Delete.Count == 0, "Incomplete: poll fast, delete nothing (" + s + " s)");
             }
-            Eq(2, log.Count, "no more log lines while it is down");
+            for (int i = 0; i < 5; i++)
+                Pass(t, match, t0.AddSeconds(30.1 + i * 0.016), log, Row("192.168.50.9", 2, NeighborState.Unreachable));
+            Eq(2, log.Count, "no more log lines while it is down, even if Unreachable keeps coming back");
 
             d = Pass(t, match, t0.AddSeconds(95), log, Row("192.168.50.9", 2, NeighborState.Reachable));
             True(!d.Urgent, "back to the normal interval");
             Eq(0, t.Count, "released when it answers");
-            True(log.Last().Contains("answered") && log.Last().Contains("held 1 time(s)"), "release logged: " + log.Last());
+            True(log.Last().Contains("answered") && log.Last().Contains("held 6 time(s)"),"release logged: " + log.Last());
         }
 
         static void TestOnlyProtectedNeighborsCount()

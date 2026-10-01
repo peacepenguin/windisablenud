@@ -23,7 +23,7 @@
 // Build: build.cmd (uses the .NET Framework 4.x csc.exe that ships with Windows).
 //
 // Usage (elevated, except status):
-//   LocalSubnetGuard.exe install [intervalMs]   install + start as a Windows service (default 250 ms)
+//   LocalSubnetGuard.exe install [intervalMs] [slowtimers]   install + start as a Windows service (default 250 ms)
 //   LocalSubnetGuard.exe uninstall              stop + remove the service (restores the NUD timers)
 //   LocalSubnetGuard.exe run [intervalMs] [trace]
 //                                               run in this console (Ctrl+C to stop and restore the timers);
@@ -59,18 +59,18 @@ namespace LocalSubnetGuard
             switch (cmd)
             {
                 case "service":
-                    ServiceBase.Run(new GuardService(ParseInterval(args, out interval) ? interval : DefaultIntervalMs));
+                    ServiceBase.Run(new GuardService(ParseInterval(args, out interval) ? interval : DefaultIntervalMs, HasFlag(args, "slowtimers")));
                     return 0;
                 case "status":
                     return Status();
                 case "install":
                 case "run":
                 {
-                    bool trace = cmd == "run" && args.Skip(1).Any(a => a.Equals("trace", StringComparison.OrdinalIgnoreCase));
-                    var rest = args.Where(a => !a.Equals("trace", StringComparison.OrdinalIgnoreCase)).ToArray();
+                    bool trace = cmd == "run" && HasFlag(args, "trace"), slow = HasFlag(args, "slowtimers");
+                    var rest = args.Where(a => !a.Equals("trace", StringComparison.OrdinalIgnoreCase) && !a.Equals("slowtimers", StringComparison.OrdinalIgnoreCase)).ToArray();
                     if (!ParseInterval(rest, out interval)) { Console.Error.WriteLine("intervalMs must be 50-60000."); return 1; }
                     if (!IsAdmin()) return NotAdmin();
-                    return cmd == "install" ? Setup.Install(interval) : RunConsole(interval, trace);
+                    return cmd == "install" ? Setup.Install(interval, slow) : RunConsole(interval, trace, slow);
                 }
                 case "uninstall":
                     if (!IsAdmin()) return NotAdmin();
@@ -83,6 +83,11 @@ namespace LocalSubnetGuard
                 default:
                     Help(); return 1;
             }
+        }
+
+        static bool HasFlag(string[] args, string flag)
+        {
+            return args.Skip(1).Any(a => a.Equals(flag, StringComparison.OrdinalIgnoreCase));
         }
 
         // The optional interval is always args[1].
@@ -109,7 +114,7 @@ namespace LocalSubnetGuard
             Console.WriteLine(
 @"LocalSubnetGuard - keep connected-subnet traffic on its adapter (works around NUD failover)
 
-  LocalSubnetGuard.exe install [intervalMs]   install + start the service (default 250 ms)
+  LocalSubnetGuard.exe install [intervalMs] [slowtimers]   install + start the service (default 250 ms)
   LocalSubnetGuard.exe uninstall              stop + remove the service (restores the NUD timers)
   LocalSubnetGuard.exe run [intervalMs] [trace]
                                               run in this console (Ctrl+C to stop and restore the timers);
@@ -122,7 +127,7 @@ namespace LocalSubnetGuard
 Log: " + Log.PathName);
         }
 
-        static int RunConsole(int intervalMs, bool trace)
+        static int RunConsole(int intervalMs, bool trace, bool slowTimers)
         {
             if (Setup.ServiceRunning())
             {
@@ -130,7 +135,7 @@ Log: " + Log.PathName);
                 return 1;
             }
             Log.Echo = true;
-            var g = new Guard(intervalMs) { Trace = trace };
+            var g = new Guard(intervalMs) { Trace = trace, SlowTimers = slowTimers };
             var done = new ManualResetEvent(false);
             Console.CancelKeyPress += (s, e) => { e.Cancel = true; done.Set(); };
             g.Start();
@@ -199,7 +204,7 @@ Log: " + Log.PathName);
             {
                 int b, r;
                 string timers = !NudTimers.Get(h.Prefix.Family, h.IfIndex, out b, out r) ? "unknown"
-                    : string.Format("base reachable {0} ms, retransmit {1} ms{2}", b, r, NudTimers.IsTuned(b, r) ? "" : " (the service lengthens them)");
+                    : string.Format("base reachable {0} ms, retransmit {1} ms{2}", b, r, NudTimers.IsTuned(b, r) ? " (lengthened)" : "");
                 Console.WriteLine("  {0,-22} on [{1}] {2}  NUD timers: {3}", h.Prefix, h.IfIndex, h.NicName, timers);
             }
 
@@ -221,12 +226,12 @@ Log: " + Log.PathName);
     class GuardService : ServiceBase
     {
         readonly Guard _g;
-        public GuardService(int intervalMs)
+        public GuardService(int intervalMs, bool slowTimers)
         {
             ServiceName = Program.ServiceName;
             CanStop = true;
             CanShutdown = true;
-            _g = new Guard(intervalMs);
+            _g = new Guard(intervalMs) { SlowTimers = slowTimers };
         }
         protected override void OnStart(string[] args) { _g.Start(); }
         protected override void OnStop() { _g.Stop(true); }
@@ -248,6 +253,13 @@ Log: " + Log.PathName);
         List<HeldSubnet> _held = new List<HeldSubnet>();
         string _lastSig;
 
+        // WFP block filters, one per protected subnet (key: prefix|adapter LUID). The dynamic session removes them
+        // by itself if this process dies, so a crash can never leave a subnet blocked.
+        Wfp _wfp;
+        readonly Dictionary<string, ulong> _filters = new Dictionary<string, ulong>();
+        string _wfpError, _lastAmbiguous = "";
+
+        public bool SlowTimers; // lengthen the NUD timers on protected adapters (off by default)
         public bool Trace; // log every state change of protected neighbors, and every entry deleted
         volatile bool _refresh = true;
         DateTime _nextRefresh = DateTime.MinValue;
@@ -274,6 +286,7 @@ Log: " + Log.PathName);
             NetworkChange.NetworkAvailabilityChanged -= OnNetAvailability;
             _stop.Set();
             if (_thread != null) _thread.Join(5000);
+            DropWfp();
             if (restoreTimers)
             {
                 var snap = Net.Snapshot();
@@ -315,6 +328,7 @@ Log: " + Log.PathName);
             var snap = Net.Snapshot();
             var held = Planner.Build(snap);
             ApplyTimers(snap, held);
+            ApplyBlocks(snap, held);
             string sig = string.Join(", ", held.Select(h =>
             {
                 int b, r;
@@ -329,11 +343,84 @@ Log: " + Log.PathName);
             _held = held;
         }
 
+        void DropWfp()
+        {
+            _filters.Clear();
+            if (_wfp != null) { _wfp.Dispose(); _wfp = null; }
+        }
+
+        // Makes the WFP filters match the protected subnets: each one gets a filter that drops outbound packets
+        // to it that would leave through any adapter but its own. Even while NUD has a neighbor Unreachable,
+        // nothing for the subnet can leak to the default gateway. Runs on every refresh, so it also repairs
+        // filters lost to a Base Filtering Engine restart.
+        void ApplyBlocks(NetSnapshot snap, List<HeldSubnet> held)
+        {
+            var ambiguous = new List<HeldSubnet>();
+            var want = new Dictionary<string, HeldSubnet>();
+            foreach (var h in Planner.Blockable(snap, held, ambiguous))
+            {
+                try { want[h.Prefix + "|" + Wfp.LuidOf(h.IfIndex)] = h; }
+                catch (InvalidOperationException ex) { Log.Write("ERROR: " + ex.Message); }
+            }
+            string amb = string.Join(", ", ambiguous.Select(h => h.Prefix + " on '" + h.NicName + "'"));
+            if (amb != _lastAmbiguous)
+            {
+                _lastAmbiguous = amb;
+                if (amb != "") Log.Write("WARNING: not blocking " + amb + ": another connected adapter has an address in the same range.");
+            }
+
+            try
+            {
+                if (_wfp != null && _filters.Values.Any(id => !_wfp.Exists(id)))
+                {
+                    Log.Write("WARNING: the WFP filters disappeared (Base Filtering Engine restarted?); reinstalling them.");
+                    DropWfp();
+                }
+                if (want.Count == 0 && _wfp == null) { _wfpError = null; return; }
+                if (_wfp == null) _wfp = Wfp.Open();
+                _wfpError = null;
+
+                foreach (var key in _filters.Keys.ToList())
+                    if (!want.ContainsKey(key))
+                    {
+                        _wfp.Remove(_filters[key]);
+                        _filters.Remove(key);
+                        Log.Write("Unblocked " + key.Substring(0, key.IndexOf('|')) + ".");
+                    }
+                foreach (var kv in want)
+                {
+                    if (_filters.ContainsKey(kv.Key)) continue;
+                    var h = kv.Value;
+                    _filters[kv.Key] = _wfp.AddBlock(h.Prefix, Wfp.LuidOf(h.IfIndex), true, "LocalSubnetGuard " + h.Prefix);
+                    Log.Write(string.Format("Blocking {0} from leaving through any adapter but '{1}'.", h.Prefix, h.NicName));
+                }
+                if (want.Count == 0) DropWfp();
+            }
+            catch (InvalidOperationException ex)
+            {
+                DropWfp(); // reopen from scratch on the next refresh
+                if (ex.Message != _wfpError) { _wfpError = ex.Message; Log.Write("ERROR: WFP block failed: " + ex.Message + " (will retry)"); }
+            }
+        }
+
         // Lengthens the NUD timers of every protected (adapter, family), and puts the originals back on
         // adapters that no longer qualify. Adapters that are not present keep their entry until they return.
         void ApplyTimers(NetSnapshot snap, List<HeldSubnet> held)
         {
-            var targets = held.GroupBy(h => h.NicId + "|" + Net.FamilyName(h.Prefix.Family)).ToDictionary(g => g.Key, g => g.First());
+            var groups = held.GroupBy(h => h.NicId + "|" + Net.FamilyName(h.Prefix.Family)).ToDictionary(g => g.Key, g => g.First());
+            if (!SlowTimers)
+            {
+                // Lengthened timers make Windows wait up to 10 s before asking again for a device that comes
+                // back, so leave them at their defaults - and undo them if an earlier run left them lengthened.
+                foreach (var h in groups.Values)
+                {
+                    int b, r;
+                    if (NudTimers.Get(h.Prefix.Family, h.IfIndex, out b, out r) && NudTimers.IsTuned(b, r))
+                        RestoreTimers(new Tuned { NicName = h.NicName, Family = h.Prefix.Family,
+                            OrigBase = NudTimers.DefaultBaseReachableMs, OrigRetransmit = NudTimers.DefaultRetransmitMs }, h.IfIndex);
+                }
+            }
+            var targets = SlowTimers ? groups : new Dictionary<string, HeldSubnet>();
             foreach (var kv in targets)
             {
                 var h = kv.Value;
@@ -471,8 +558,10 @@ Log: " + Log.PathName);
                     d.Delete.Add(i);
                     d.Flush = true;
                     d.Urgent = true;
-                    log(string.Format("{0} was marked Unreachable on '{1}' - holding it on the local adapter", r.Address, h.NicName));
-                    Touch(r, h, now, log, null).Holds++;
+                    var e = Touch(r, h, now, log, null);
+                    // Windows re-creates the entry as Unreachable while traffic continues: log only the first hold.
+                    if (e.Holds++ == 0)
+                        log(string.Format("{0} was marked Unreachable on '{1}' - holding it on the local adapter (repeats are not logged)", r.Address, h.NicName));
                 }
                 else if (r.State == NeighborState.Reachable || r.State == NeighborState.Stale || r.State == NeighborState.Permanent)
                 {
@@ -528,6 +617,21 @@ Log: " + Log.PathName);
             return held;
         }
 
+        // The protected subnets that can safely get a "never leave through another adapter" block: those that
+        // no other connected adapter also has an address in. Where subnets overlap, traffic legitimately
+        // leaves through either adapter, so those are only skipped (and returned in `ambiguous`).
+        public static List<HeldSubnet> Blockable(NetSnapshot snap, List<HeldSubnet> held, List<HeldSubnet> ambiguous)
+        {
+            var ok = new List<HeldSubnet>();
+            foreach (var h in held)
+            {
+                bool overlap = snap.Nics.Any(n => n.Up && !string.Equals(n.Id, h.NicId, StringComparison.OrdinalIgnoreCase) &&
+                                                  n.Prefixes.Any(p => p.Overlaps(h.Prefix)));
+                (overlap ? ambiguous : ok).Add(h);
+            }
+            return ok;
+        }
+
         public static HeldSubnet Match(IEnumerable<HeldSubnet> held, NeighborRow n)
         {
             return held.FirstOrDefault(h => h.IfIndex == n.IfIndex && h.Prefix.Contains(n.Addr));
@@ -550,6 +654,13 @@ Log: " + Log.PathName);
 
         public AddressFamily Family { get { return _net.Length == 4 ? AddressFamily.InterNetwork : AddressFamily.InterNetworkV6; } }
         public byte[] NetworkBytes { get { return (byte[])_net.Clone(); } }
+
+        // True if the two prefixes share any address (one contains the other).
+        public bool Overlaps(Prefix o)
+        {
+            if (o._net.Length != _net.Length) return false;
+            return Length <= o.Length ? Contains(o._net) : o.Contains(_net);
+        }
 
         public bool Contains(byte[] addr)
         {
@@ -770,6 +881,8 @@ Log: " + Log.PathName);
         [DllImport("fwpuclnt.dll")] static extern uint FwpmEngineClose0(IntPtr engine);
         [DllImport("fwpuclnt.dll")] static extern uint FwpmSubLayerAdd0(IntPtr engine, ref SubLayer subLayer, IntPtr sd);
         [DllImport("fwpuclnt.dll")] static extern uint FwpmFilterAdd0(IntPtr engine, ref Filter filter, IntPtr sd, out ulong id);
+        [DllImport("fwpuclnt.dll")] static extern uint FwpmFilterDeleteById0(IntPtr engine, ulong id);
+        [DllImport("fwpuclnt.dll")] static extern uint FwpmFilterGetById0(IntPtr engine, ulong id, out IntPtr filter);
         [DllImport("fwpuclnt.dll")] static extern uint FwpmLayerGetByKey0(IntPtr engine, ref Guid key, out IntPtr layer);
         [DllImport("fwpuclnt.dll")] static extern void FwpmFreeMemory0(ref IntPtr p);
         [DllImport("iphlpapi.dll")] static extern int ConvertInterfaceIndexToLuid(uint ifIndex, out ulong luid);
@@ -874,6 +987,18 @@ Log: " + Log.PathName);
             }
             finally { foreach (var p in mem) Marshal.FreeHGlobal(p); }
         }
+
+        // True if the filter is still installed. False if it is gone or the engine no longer answers
+        // (e.g. the Base Filtering Engine was restarted, which drops every dynamic filter).
+        public bool Exists(ulong id)
+        {
+            IntPtr p;
+            if (FwpmFilterGetById0(_engine, id, out p) != 0) return false;
+            FwpmFreeMemory0(ref p);
+            return true;
+        }
+
+        public void Remove(ulong id) { Check(FwpmFilterDeleteById0(_engine, id), "remove filter " + id); }
 
         static uint Subnet4Mask(int len) { return len == 0 ? 0u : uint.MaxValue << (32 - len); }
 
@@ -1054,7 +1179,7 @@ Log: " + Log.PathName);
             }
         }
 
-        public static int Install(int intervalMs)
+        public static int Install(int intervalMs, bool slowTimers)
         {
             // Retire the earlier PowerShell implementation (a scheduled task of the same name) if it is still installed.
             if (Run("schtasks.exe", "/Query /TN LocalSubnetGuard", false) == 0)
@@ -1072,10 +1197,10 @@ Log: " + Log.PathName);
             if (!string.Equals(Path.GetFullPath(src), Path.GetFullPath(dst), StringComparison.OrdinalIgnoreCase))
                 CopyWithRetry(src, dst);
 
-            string bin = "\\\"" + dst + "\\\" service " + intervalMs;
+            string bin = "\\\"" + dst + "\\\" service " + intervalMs + (slowTimers ? " slowtimers" : "");
             int rc = ServiceExists()
-                ? Run("sc.exe", "config " + Program.ServiceName + " binPath= \"" + bin + "\" start= auto")
-                : Run("sc.exe", "create " + Program.ServiceName + " binPath= \"" + bin + "\" start= auto DisplayName= \"Local Subnet Guard\"");
+                ? Run("sc.exe", "config " + Program.ServiceName + " binPath= \"" + bin + "\" start= auto depend= BFE")
+                : Run("sc.exe", "create " + Program.ServiceName + " binPath= \"" + bin + "\" start= auto depend= BFE DisplayName= \"Local Subnet Guard\"");
             if (rc != 0) return 1;
 
             Run("sc.exe", "description " + Program.ServiceName + " \"Keeps connected-subnet traffic on its adapter; works around NUD failover to the default gateway.\"");
