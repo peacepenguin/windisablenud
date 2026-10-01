@@ -206,7 +206,7 @@ namespace LocalSubnetGuard.Tests
             var d = Pass(t, match, t0.AddSeconds(1), log, Row("192.168.50.9", 2, NeighborState.Incomplete));
             True(d.Delete.Count == 0 && !d.Flush, "not stuck yet");
             d = Pass(t, match, t0.AddSeconds(2.5), log, Row("192.168.50.9", 2, NeighborState.Incomplete));
-            True(d.Delete.Count == 1 && d.Flush, "stuck: entry deleted and path cache flushed");
+            True(d.Delete.Count == 1 && !d.Flush, "stuck: entry deleted, path cache left alone");
             True(log.Last().Contains("clearing its entry"), "logged: " + log.Last());
             d = Pass(t, match, t0.AddSeconds(3.5), log, Row("192.168.50.9", 2, NeighborState.Incomplete));
             True(d.Delete.Count == 0, "the countdown restarts after a reset");

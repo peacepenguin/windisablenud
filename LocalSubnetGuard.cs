@@ -537,6 +537,8 @@ Log: " + Log.PathName);
     // leaving through the wrong adapter, so this only has to get the entry out of the way quickly:
     //  - Unreachable: Windows now routes the neighbor's traffic to the (blocked) default gateway; the entry is
     //    deleted and the path cache flushed, so the next packet makes Windows resolve it on the local adapter.
+    //    This is the only case that flushes: the flush is global (every adapter's cached paths), so it is not
+    //    done for the early deletes below, which keep the neighbor from ever getting here.
     //  - Incomplete for StuckAfterIncomplete: Windows normally gives up after ~3 s, but an entry sometimes stays
     //    Incomplete without sending anything (seen in traces), so a returning device is never found. It is
     //    deleted early; Windows then restarts the lookup.
@@ -569,8 +571,7 @@ Log: " + Log.PathName);
                     var limit = r.State == NeighborState.Incomplete ? StuckAfterIncomplete : StuckAfterProbe;
                     if (now - e.StateSince >= limit)
                     {
-                        d.Delete.Add(i);
-                        d.Flush = true;
+                        d.Delete.Add(i); // no path-cache flush: nothing was routed away from the adapter yet
                         if (e.Holds++ == 0)
                             log(string.Format("{0} has been in state {1} on '{2}' for {3:0}s - clearing its entry so it is looked up again (repeats are not logged)",
                                 r.Address, r.State, h.NicName, (now - e.StateSince).TotalSeconds));

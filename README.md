@@ -46,7 +46,7 @@ IPv4 and IPv6, in three layers:
    reads the neighbor table and, for neighbors in the protected subnets:
    - deletes entries marked **Unreachable** and flushes the path cache, so the next packet makes Windows
      look the device up again on the local adapter;
-   - deletes entries that stay **Incomplete** for 2 s (Windows normally gives up after about 3 s, but an
+   - deletes entries that stay **Incomplete** for 2 s (without flushing the path cache, which is global) (Windows normally gives up after about 3 s, but an
      entry sometimes stays Incomplete without sending anything, so a device that comes back is never
      found - seen in traces);
    - deletes entries that stay in **Probe** for more than 12 s (normally 4-8 s).
