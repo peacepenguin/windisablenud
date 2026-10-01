@@ -40,40 +40,30 @@ IPv4 and IPv6, in three layers:
    The two layers below keep the connection *working* (device re-resolved on the right adapter); this
    one guarantees it can't *leak*.
 
-1. **Slow NUD down (optional, `slowtimers`).** Off by default: with the WFP block in place a leak is
-   impossible, and long timers make Windows wait up to 10 s before asking again for a device that comes
-   back. Existing lengthened timers are restored to the defaults at startup. When enabled, NUD's timers can be changed even though NUD can't be turned off. By default
-   Windows probes a neighbor 3 times, 1 s apart, and marks it Unreachable if none of the probes is
-   answered, so about 3 s of silence is enough to trigger failover. The service sets
-   `retransmittime=10000` and `basereachabletime=120000` on the adapter, so a neighbor has to be silent
-   for about 30 s, and is probed far less often. Short outages such as a device reboot or a switch
-   restart then never cause failover at all. The change is made with `netsh ... store=active`, so a reboot
-   always resets it, and the original values are put back when the service stops or the adapter gains a
-   default gateway.
-2. **Hold, fast.** When a neighbor is marked Unreachable, the service deletes the entry and flushes the
-   path cache. Windows then re-resolves the address on the local adapter instead of re-routing it to the
-   gateway. Unreachable only ever follows a failing probe (state Probe) or lookup (state Incomplete), so
-   while any protected neighbor is in one of those states the service checks every 100 ms instead of
-   every 500 ms. It catches the Unreachable within about 100 ms, and resets an entry that stays in Incomplete for more than 5 s or
-   Probe for more than 12 s (stuck: seen about once in 20-50 cycles). (The WFP block, not this speed, is what prevents leaks.)
+1. **Clear failing neighbors.** Once the WFP filter is in place a failing neighbor can no longer leak, but
+   Windows still routes its traffic to the (blocked) default gateway while its entry is Unreachable, so
+   pings and connections fail with "General failure" until the entry is gone. Once a second the service
+   reads the neighbor table and, for neighbors in the protected subnets:
+   - deletes entries marked **Unreachable** and flushes the path cache, so the next packet makes Windows
+     look the device up again on the local adapter;
+   - deletes entries that stay **Incomplete** for 2 s (Windows normally gives up after about 3 s, but an
+     entry sometimes stays Incomplete without sending anything, so a device that comes back is never
+     found - seen in traces);
+   - deletes entries that stay in **Probe** for more than 12 s (normally 4-8 s).
 
-The Unreachable itself can't be prevented. Deleting an entry while it is in Probe or Incomplete, to
-restart the countdown, makes Windows mark the neighbor Unreachable immediately (seen in traces), so the
-service never does that.
+   A device that returns is found again on the next lookup, typically within a second of its link coming up.
+   The log says once per outage when a device stops answering, and when it is back.
+2. **Slow NUD down (optional, `slowtimers`).** Off by default: long timers make Windows wait up to 10 s
+   before asking again for a device that comes back. Existing lengthened timers are restored to the
+   defaults at startup. When enabled, the NUD timers are lengthened (NUD itself can't be turned off): by
+   default Windows probes a neighbor 3 times, 1 s apart, so about 3 s of silence triggers failover;
+   `retransmittime=10000` and `basereachabletime=120000` make that about 30 s. The change uses
+   `netsh ... store=active`, so a reboot resets it, and the originals are put back when the service stops
+   or the adapter gains a default gateway.
 
-What to expect when a device stops answering:
-
-- **Outages shorter than about 30 s** (device reboot, switch restart) never reach Unreachable, so no
-  traffic leaves via the gateway.
-- **Longer outages** reach Unreachable once, about 30 s after probing starts. Traffic can go out the
-  gateway for the ~100 ms until the hold catches it. After that, Windows keeps looking the device up
-  (state Incomplete) for as long as traffic continues. In traces this lasted without another Unreachable,
-  and the device was found again as soon as it answered.
-
-The service logs when a device stops answering, when it is held and when it comes back. `run trace` also
-logs every state change of the protected neighbors. The set of protected adapters follows the live network
-configuration, re-checked on every address change and every 5 seconds. Nothing is blocked and no network
-is remembered. The only thing written to disk is the log.
+`run trace` also logs every state change of the protected neighbors. The set of protected adapters follows
+the live network configuration, re-checked on every address change and every 5 seconds. No network is
+remembered. The only thing written to disk is the log.
 
 Costs on the protected adapters:
 
@@ -89,7 +79,7 @@ Build with `build.cmd`, or download the exe from the CI artifacts. Then, from an
 
 ```
 LocalSubnetGuard.exe install [intervalMs] [slowtimers]
-                                            install + start the service (default 500 ms)
+                                            install + start the service (default 1000 ms)
 LocalSubnetGuard.exe uninstall              stop + remove the service (restores the NUD timers)
 LocalSubnetGuard.exe run [intervalMs] [trace] [slowtimers]
                                             run in this console (Ctrl+C to stop and restore the timers);

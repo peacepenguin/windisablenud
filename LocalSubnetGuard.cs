@@ -14,7 +14,7 @@
 //  2. Hold      a neighbor in one of the adapter's subnets that is marked Unreachable anyway has its
 //               entry deleted and the path cache flushed, so Windows re-resolves it on the local adapter
 //               instead of re-routing it. While a neighbor is failing (Probe or Incomplete) the neighbor
-//               table is polled every 100 ms instead of every interval, so this happens within ~100 ms.
+//               table is polled every interval (1 s), so this happens within a second.
 //               Unreachable itself cannot be prevented: deleting an entry that is in Probe or Incomplete
 //               makes Windows mark it Unreachable at once.
 //
@@ -23,7 +23,7 @@
 // Build: build.cmd (uses the .NET Framework 4.x csc.exe that ships with Windows).
 //
 // Usage (elevated, except status):
-//   LocalSubnetGuard.exe install [intervalMs] [slowtimers]   install + start as a Windows service (default 500 ms)
+//   LocalSubnetGuard.exe install [intervalMs] [slowtimers]   install + start as a Windows service (default 1000 ms)
 //   LocalSubnetGuard.exe uninstall              stop + remove the service (restores the NUD timers)
 //   LocalSubnetGuard.exe run [intervalMs] [trace]
 //                                               run in this console (Ctrl+C to stop and restore the timers);
@@ -50,7 +50,7 @@ namespace LocalSubnetGuard
     static class Program
     {
         public const string ServiceName = "LocalSubnetGuard";
-        public const int DefaultIntervalMs = 500;
+        public const int DefaultIntervalMs = 1000;
 
         static int Main(string[] args)
         {
@@ -121,7 +121,7 @@ namespace LocalSubnetGuard
             Console.WriteLine(
 @"LocalSubnetGuard - keep connected-subnet traffic on its adapter (works around NUD failover)
 
-  LocalSubnetGuard.exe install [intervalMs] [slowtimers]   install + start the service (default 500 ms)
+  LocalSubnetGuard.exe install [intervalMs] [slowtimers]   install + start the service (default 1000 ms)
   LocalSubnetGuard.exe uninstall              stop + remove the service (restores the NUD timers)
   LocalSubnetGuard.exe run [intervalMs] [trace]
                                               run in this console (Ctrl+C to stop and restore the timers);
@@ -250,7 +250,6 @@ Log: " + Log.PathName);
     {
         class Tuned { public string NicId, NicName; public AddressFamily Family; public int OrigBase, OrigRetransmit; }
 
-        const int FastIntervalMs = 100; // poll interval while a protected neighbor is failing
 
         readonly int _intervalMs;
         readonly HoldTracker _hold4 = new HoldTracker(), _hold6 = new HoldTracker();
@@ -317,12 +316,11 @@ Log: " + Log.PathName);
         {
             while (!_stop.WaitOne(0))
             {
-                bool urgent = false;
                 var sw = Stopwatch.StartNew();
-                try { urgent = Tick(); }
+                try { Tick(); }
                 catch (Exception ex) { Log.Write("ERROR: " + ex.Message); }
                 if (sw.ElapsedMilliseconds > 500) Log.Write(string.Format("WARNING: a hold pass took {0} ms", sw.ElapsedMilliseconds));
-                _stop.WaitOne(urgent ? Math.Min(FastIntervalMs, _intervalMs) : _intervalMs);
+                _stop.WaitOne(_intervalMs);
             }
         }
 
@@ -484,12 +482,10 @@ Log: " + Log.PathName);
                 : string.Format("ERROR: could not restore NUD timers on '{0}' ({1}): {2}", t.NicName, Net.FamilyName(t.Family), err));
         }
 
-        // Returns true while a protected neighbor is failing (Probe, Incomplete or Unreachable), so the loop
-        // polls fast and catches it being marked Unreachable within FastIntervalMs.
-        bool Tick()
+        // One pass over the neighbor tables: deletes failing entries of the protected subnets.
+        void Tick()
         {
             var all = _held;
-            bool urgent = false;
             foreach (var fam in Net.Families)
             {
                 var held = all.Where(h => h.Prefix.Family == fam).ToList();
@@ -500,7 +496,6 @@ Log: " + Log.PathName);
                 {
                     var d = tracker.Decide(table, r => Planner.Match(held, r), DateTime.UtcNow, Log.Write);
                     flush = d.Flush;
-                    if (d.Urgent) urgent = true;
                     return d.Delete;
                 }, (r, rc) =>
                 {
@@ -514,7 +509,6 @@ Log: " + Log.PathName);
                 }
                 if (Trace) TraceStates(rows.Where(r => Planner.Match(held, r) != null), fam);
             }
-            return urgent;
         }
 
         // Logs each state change of a protected neighbor (as read at the start of this pass).
@@ -539,25 +533,23 @@ Log: " + Log.PathName);
         }
     }
 
-    // Catches NUD giving up on a neighbor in a protected subnet. Windows marks a neighbor Unreachable after
-    // about 3 x RetransmitTime of unanswered probes (state Probe) or solicitations (state Incomplete), and
-    // from then on routes its traffic to the default gateway. That cannot be prevented: deleting an entry in
-    // Probe or Incomplete makes Windows mark it Unreachable at once (seen in traces). So while a protected
-    // neighbor is in one of those states the caller polls fast (Decision.Urgent), and the moment one is
-    // marked Unreachable its entry is deleted and the caller flushes the path cache, so Windows re-resolves
-    // it on the local adapter. An episode ends when the neighbor answers, or after Expiry without it being
-    // seen in Probe, Incomplete or Unreachable (no more traffic to it).
+    // Keeps failing neighbors of the protected subnets from sticking. The WFP filters already stop anything
+    // leaving through the wrong adapter, so this only has to get the entry out of the way quickly:
+    //  - Unreachable: Windows now routes the neighbor's traffic to the (blocked) default gateway; the entry is
+    //    deleted and the path cache flushed, so the next packet makes Windows resolve it on the local adapter.
+    //  - Incomplete for StuckAfterIncomplete: Windows normally gives up after ~3 s, but an entry sometimes stays
+    //    Incomplete without sending anything (seen in traces), so a returning device is never found. It is
+    //    deleted early; Windows then restarts the lookup.
+    //  - Probe for StuckAfterProbe: same, for a probe that never ends (they normally last 4-8 s).
+    // An episode ends when the neighbor answers, or after Expiry without it being seen in a failing state.
     class HoldTracker
     {
-        class Episode { public string Nic; public DateTime Since, LastSeen; public int Holds; public NeighborState State = (NeighborState)(-1); public DateTime StateSince; }
+        class Episode { public string Nic; public DateTime Since, LastSeen, StateSince; public int Holds; public NeighborState State = (NeighborState)(-1); }
 
-        public class Decision { public List<int> Delete = new List<int>(); public bool Flush, Urgent; }
+        public class Decision { public List<int> Delete = new List<int>(); public bool Flush; }
 
         public static readonly TimeSpan Expiry = TimeSpan.FromSeconds(60);
-        // Windows leaves Incomplete after ~3 s and Probe after at most ~8 s. A neighbor that stays in either far
-        // longer is stuck (traces showed it staying Incomplete while traffic leaked to the blocked gateway):
-        // its entry is deleted so resolution starts over.
-        public static readonly TimeSpan StuckAfterIncomplete = TimeSpan.FromSeconds(5), StuckAfterProbe = TimeSpan.FromSeconds(12);
+        public static readonly TimeSpan StuckAfterIncomplete = TimeSpan.FromSeconds(2), StuckAfterProbe = TimeSpan.FromSeconds(12);
         readonly Dictionary<string, Episode> _episodes = new Dictionary<string, Episode>();
 
         public int Count { get { return _episodes.Count; } }
@@ -572,14 +564,16 @@ Log: " + Log.PathName);
                 if (h == null) continue;
                 if (r.State == NeighborState.Probe || r.State == NeighborState.Incomplete)
                 {
-                    d.Urgent = true;
-                    var e = Touch(r, h, now, log, "{0} is not answering on '{1}' ({2}) - watching it closely");
+                    var e = Touch(r, h, now, log, "{0} is not answering on '{1}' ({2}) - watching it");
                     if (e.State != r.State) { e.State = r.State; e.StateSince = now; }
-                    else if (now - e.StateSince > (r.State == NeighborState.Incomplete ? StuckAfterIncomplete : StuckAfterProbe))
+                    var limit = r.State == NeighborState.Incomplete ? StuckAfterIncomplete : StuckAfterProbe;
+                    if (now - e.StateSince >= limit)
                     {
                         d.Delete.Add(i);
                         d.Flush = true;
-                        log(string.Format("{0} has been in state {1} on '{2}' for {3:0}s - resetting its entry", r.Address, r.State, h.NicName, (now - e.StateSince).TotalSeconds));
+                        if (e.Holds++ == 0)
+                            log(string.Format("{0} has been in state {1} on '{2}' for {3:0}s - clearing its entry so it is looked up again (repeats are not logged)",
+                                r.Address, r.State, h.NicName, (now - e.StateSince).TotalSeconds));
                         e.StateSince = now;
                     }
                 }
@@ -587,19 +581,17 @@ Log: " + Log.PathName);
                 {
                     d.Delete.Add(i);
                     d.Flush = true;
-                    d.Urgent = true;
                     var e = Touch(r, h, now, log, null);
                     if (e.State != r.State) { e.State = r.State; e.StateSince = now; }
-                    // Windows re-creates the entry as Unreachable while traffic continues: log only the first hold.
                     if (e.Holds++ == 0)
-                        log(string.Format("{0} was marked Unreachable on '{1}' - holding it on the local adapter (repeats are not logged)", r.Address, h.NicName));
+                        log(string.Format("{0} was marked Unreachable on '{1}' - clearing its entry so it is looked up again (repeats are not logged)", r.Address, h.NicName));
                 }
                 else if (r.State == NeighborState.Reachable || r.State == NeighborState.Stale || r.State == NeighborState.Permanent)
                 {
                     Episode e;
                     if (_episodes.TryGetValue(r.Key, out e))
                     {
-                        log(string.Format("{0} answered on '{1}' ({2}) after {3:0.0}s, held {4} time(s)",
+                        log(string.Format("{0} answered on '{1}' ({2}) after {3:0.0}s, cleared {4} time(s)",
                             r.Address, e.Nic, r.State, (now - e.Since).TotalSeconds, e.Holds));
                         _episodes.Remove(r.Key);
                     }

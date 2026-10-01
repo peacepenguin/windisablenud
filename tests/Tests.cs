@@ -171,30 +171,29 @@ namespace LocalSubnetGuard.Tests
             var t0 = new DateTime(2026, 1, 1);
 
             var d = Pass(t, match, t0, log, Row("192.168.50.9", 2, NeighborState.Probe));
-            True(d.Urgent && d.Delete.Count == 0 && !d.Flush, "Probe: poll fast, delete nothing");
-            True(log.Single().Contains("watching it closely") && log.Single().Contains("Probe"), "logged: " + log.Single());
+            True(d.Delete.Count == 0 && !d.Flush, "Probe: delete nothing");
+            True(log.Single().Contains("watching it") && log.Single().Contains("Probe"), "logged: " + log.Single());
 
             d = Pass(t, match, t0.AddSeconds(9), log, Row("192.168.50.9", 2, NeighborState.Probe));
             True(d.Delete.Count == 0 && !d.Flush, "A normal Probe is never deleted");
 
             d = Pass(t, match, t0.AddSeconds(30), log, Row("192.168.50.9", 2, NeighborState.Unreachable));
             Eq("0", string.Join(",", d.Delete), "Unreachable is held");
-            True(d.Flush && d.Urgent, "path cache flushed, still polling fast");
+            True(d.Flush, "path cache flushed");
             True(log.Last().Contains("marked Unreachable"), "logged: " + log.Last());
 
-            for (int s = 31; s <= 34; s++)
+            for (int s = 31; s <= 32; s++)
             {
                 d = Pass(t, match, t0.AddSeconds(s), log, Row("192.168.50.9", 2, NeighborState.Incomplete));
-                True(d.Urgent && d.Delete.Count == 0, "Incomplete: poll fast, delete nothing (" + s + " s)");
+                True(d.Delete.Count == 0, "a fresh Incomplete is left alone (" + s + " s)");
             }
             for (int i = 0; i < 5; i++)
-                Pass(t, match, t0.AddSeconds(34.1 + i * 0.016), log, Row("192.168.50.9", 2, NeighborState.Unreachable));
+                Pass(t, match, t0.AddSeconds(32.1 + i * 0.016), log, Row("192.168.50.9", 2, NeighborState.Unreachable));
             Eq(2, log.Count, "no more log lines while it is down, even if Unreachable keeps coming back");
 
             d = Pass(t, match, t0.AddSeconds(95), log, Row("192.168.50.9", 2, NeighborState.Reachable));
-            True(!d.Urgent, "back to the normal interval");
             Eq(0, t.Count, "released when it answers");
-            True(log.Last().Contains("answered") && log.Last().Contains("held 6 time(s)"),"release logged: " + log.Last());
+            True(log.Last().Contains("answered") && log.Last().Contains("cleared 6 time(s)"),"release logged: " + log.Last());
         }
 
         static void TestStuckNeighborIsReset()
@@ -204,12 +203,12 @@ namespace LocalSubnetGuard.Tests
             var t = new HoldTracker();
             var t0 = new DateTime(2026, 1, 1);
             Pass(t, match, t0, log, Row("192.168.50.9", 2, NeighborState.Incomplete));
-            var d = Pass(t, match, t0.AddSeconds(4), log, Row("192.168.50.9", 2, NeighborState.Incomplete));
+            var d = Pass(t, match, t0.AddSeconds(1), log, Row("192.168.50.9", 2, NeighborState.Incomplete));
             True(d.Delete.Count == 0 && !d.Flush, "not stuck yet");
-            d = Pass(t, match, t0.AddSeconds(6), log, Row("192.168.50.9", 2, NeighborState.Incomplete));
-            True(d.Delete.Count == 1 && d.Flush && d.Urgent, "stuck: entry deleted and path cache flushed");
-            True(log.Last().Contains("resetting"), "logged: " + log.Last());
-            d = Pass(t, match, t0.AddSeconds(7), log, Row("192.168.50.9", 2, NeighborState.Incomplete));
+            d = Pass(t, match, t0.AddSeconds(2.5), log, Row("192.168.50.9", 2, NeighborState.Incomplete));
+            True(d.Delete.Count == 1 && d.Flush, "stuck: entry deleted and path cache flushed");
+            True(log.Last().Contains("clearing its entry"), "logged: " + log.Last());
+            d = Pass(t, match, t0.AddSeconds(3.5), log, Row("192.168.50.9", 2, NeighborState.Incomplete));
             True(d.Delete.Count == 0, "the countdown restarts after a reset");
         }
 
@@ -224,7 +223,7 @@ namespace LocalSubnetGuard.Tests
                 Row("192.168.50.11", 2, NeighborState.Reachable),
                 Row("192.168.50.12", 2, NeighborState.Delay),       // Delay does not fail by itself
                 Row("192.168.50.13", 2, NeighborState.Stale));
-            True(d.Delete.Count == 0 && !d.Flush && !d.Urgent && log.Count == 0 && t.Count == 0, "nothing to do");
+            True(d.Delete.Count == 0 && !d.Flush && log.Count == 0 && t.Count == 0, "nothing to do");
         }
 
         static void TestEpisodeExpiresWithoutTraffic()
@@ -241,7 +240,7 @@ namespace LocalSubnetGuard.Tests
             Eq(0, t.Count, "dropped after expiry");
             True(log.Last().Contains("fd00:50::9") && log.Last().Contains("no longer tracking"), "expiry logged: " + log.Last());
         }
-        static void AssertIdle(HoldTracker.Decision d) { True(!d.Urgent && d.Delete.Count == 0, "entry gone: back to the normal interval"); }
+        static void AssertIdle(HoldTracker.Decision d) { True(d.Delete.Count == 0, "entry gone: nothing to do"); }
 
         // ---------------------------------------------------------------- native layouts (read-only)
         static void TestNativeLayouts()
